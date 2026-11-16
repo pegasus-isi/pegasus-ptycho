@@ -50,9 +50,10 @@ ptycho-workflow/
 
 ## Prerequisites
 
-- [Pegasus WMS](https://pegasus.isi.edu/) >= 5.0 and [HTCondor](https://htcondor.org/) >= 10.2 on the submit host
+- [Pegasus WMS](https://pegasus.isi.edu/) >= 5.1.3 and [HTCondor](https://htcondor.org/) >= 10.2 on the submit host
 - Python 3.8+ with `pandas` and `openpyxl` on the submit host (the generator reads the `.xlsx` files)
-- An HTCondor pool with GPU slots. On the GPU workers:
+- Pegasus >= 5.1.3 for [hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs) and job tagging. The planner also needs outbound HTTPS to GitHub.
+- A compute resource described by one of the hosted site catalogs (an HTCondor pool, or a SLURM cluster), with GPUs. On the GPU workers:
   - MATLAB with the Parallel Computing Toolbox, either through `module load matlab/2021b` or on `PATH`
   - `python3` (the recon wrapper runs on the host, not in a container)
 - A fold_slice checkout
@@ -105,6 +106,51 @@ Zaratan layout, with scan folders directly inside it; a `Data/` sub-folder also 
   multislice mode, those four values come from `--previous-object`,
   `--regularization`, `--thickness` and `--nlayers`.
 
+## Execution site: hosted site catalogs
+
+The generator does not describe the execution site itself. It uses Pegasus'
+[centrally hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs):
+
+- `--site-catalog-file` sets `pegasus.catalog.site.repo.file`. At plan time,
+  the planner downloads that file from
+  [pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf),
+  from the branch matching its own major.minor version (e.g. `6.0`). It saves
+  the file next to `workflow.yml` and downloads it again once it is more than
+  a day old.
+- Jobs are planned for the site named **`compute`**, the name every hosted
+  catalog uses for its execution site.
+- The `sites.yml` the generator writes describes only the submit host
+  (`local`: `scratch/` and `output/`). Pegasus merges it over the downloaded
+  catalog, and local entries win.
+
+| Hosted file | Resource |
+|-------------|----------|
+| `access-pegasus.yml`, `access-pegasus-expanse.yml` | ACCESS Pegasus (HTCondor glideins) |
+| `ospool-ap40.yml`, `ospool-ap41.yml` | OSPool access points |
+| `usc-discovery.yml`, `usc-laguna.yml`, `unity.yml`, `purdue-anvil.yml` | SLURM clusters (direct submission) |
+| `nersc-perlmutter.yml` | NERSC Perlmutter (SFAPI) |
+
+**Job tags.** `ptycho_recon` jobs are tagged `gpu`, and `render_script` /
+`summarize` jobs are tagged `cpu`. When the hosted entry has `x-tags`, the
+planner adds that tag's profiles. With `usc-discovery.yml`, for example,
+recon jobs go to the `gpu` queue and the Python steps stay on `main`.
+Resources set in the transformation catalog take precedence over the site
+catalog. Recon jobs always ask for 4 cores, 1 GPU, `--recon-memory` (40 GB)
+and `--recon-runtime` (4 h). The runtime matters on SLURM catalogs, which
+otherwise default to 30 minutes.
+
+**Overriding the hosted entry.** Use `--site-profile NS.KEY=VALUE`
+(repeatable). Each one becomes a
+`pegasus.catalog.site.sites.compute.profiles.NS.KEY` property, e.g.
+`--site-profile pegasus.project=myalloc` or `--site-profile pegasus.queue=gpu-a100`.
+Several hosted catalogs read `${RESOURCE_PROJECT}` from the environment when
+planning, so set that variable as well when your catalog uses it.
+
+**fold_slice on batch clusters.** `--fold-slice-dir` ships fold_slice through
+HTCondor file transfer, which suits HTCondor pools (access-pegasus, ospool).
+On SLURM catalogs, the workers usually share a filesystem with your home
+directory, so use `--fold-slice-worker-path` instead.
+
 ## Usage
 
 ### Generate the workflow
@@ -112,8 +158,22 @@ Zaratan layout, with scan folders directly inside it; a `Data/` sub-folder also 
 ```bash
 ./workflow_generator.py \
     --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" \
+    --site-catalog-file access-pegasus.yml \
     --fold-slice-dir /home/zhangych/fold_slice \
     --mode multislice \
+    --output workflow.yml
+```
+
+On a SLURM cluster with a hosted catalog, with fold_slice already on the
+shared filesystem:
+
+```bash
+export RESOURCE_PROJECT=myalloc
+./workflow_generator.py \
+    --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" \
+    --site-catalog-file usc-discovery.yml \
+    --fold-slice-worker-path /home/zhangych/fold_slice \
+    --site-profile pegasus.project=myalloc \
     --output workflow.yml
 ```
 
@@ -123,6 +183,7 @@ To try it on the bundled sample dataset (which has no
 ```bash
 ./workflow_generator.py \
     --data-dir "../Sample dataset" \
+    --site-catalog-file access-pegasus.yml \
     --fold-slice-dir /home/zhangych/fold_slice \
     --bg-file "/path/to/Background subtraction.mat" \
     --skip-missing \
@@ -139,6 +200,9 @@ problems. `--skip-missing` drops those scans and continues.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--data-dir` | (required) | Experiment folder |
+| `--site-catalog-file` | (required) | Hosted site catalog file name, e.g. `access-pegasus.yml` |
+| `--site-profile` | none | Override a profile of the hosted `compute` site, `NS.KEY=VALUE` (repeatable) |
+| `--site-catalog-refresh` | 1 day | Re-download the hosted catalog when older than this many seconds |
 | `--fold-slice-dir` | one of the two is required | fold_slice on the submit host, transferred to each recon job by HTCondor |
 | `--fold-slice-worker-path` | | fold_slice already present on every worker (shared FS); nothing is transferred |
 | `--mode` | `multislice` | `multislice` or `singleslice` template |
@@ -152,19 +216,20 @@ problems. `--skip-missing` drops those scans and continues.
 | `--matlab-module` | `matlab/2021b` | Module to load before MATLAB; `''` to skip |
 | `--matlab-cmd` | `matlab` | MATLAB executable |
 | `--recon-memory` | `40 GB` | Memory per recon job |
+| `--recon-runtime` | `14400` | Walltime per recon job in seconds (batch sites) |
 | `--gpu-requirements` | none | Extra HTCondor `requirements`, e.g. `'(GPUs_GlobalMemoryMb >= 40000)'` |
 | `--container-image` | `./Ptycho_Container.sif` | Container for the Python steps |
 | `--no-container` | off | Run the Python steps without a container |
 | `--retry` | `1` | DAGMan retries per job |
 | `--output-dir` | `./output` | Where final outputs are staged |
-| `-e`, `--execution-site-name` | `condorpool` | HTCondor execution site name |
-| `-s`, `--skip-sites-catalog` | off | Skip site catalog creation |
+| `-e`, `--execution-site-name` | `compute` | Execution site name in the hosted catalog |
+| `-s`, `--skip-sites-catalog` | off | Don't write the local `sites.yml` (Pegasus then uses its default `local` site) |
 | `-o`, `--output` | `workflow.yml` | Output workflow file |
 
 ### Plan and submit
 
 ```bash
-pegasus-plan --submit --dir submit --sites condorpool --output-sites local workflow.yml
+pegasus-plan --submit --dir submit --sites compute --output-sites local workflow.yml
 ```
 
 ### Monitor
@@ -233,6 +298,6 @@ with fold_slice on it, use `--fold-slice-worker-path` to skip that copy.
 
 ## Dependencies
 
-- Submit host: Pegasus 5.x, HTCondor, Python 3 with `pandas`, `openpyxl`
+- Submit host: Pegasus >= 5.1.3, HTCondor, Python 3 with `pandas`, `openpyxl`
 - GPU workers: MATLAB (R2021b tested by the original scripts) with the Parallel Computing Toolbox, CUDA-capable GPU, `python3`
 - Container (`python:3.12-slim`): Python standard library only

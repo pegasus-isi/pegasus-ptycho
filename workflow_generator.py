@@ -14,8 +14,15 @@ Pipeline steps (per scan, all scans in parallel):
 Then, once for the whole experiment:
 3. summarize     - collect the per-scan summaries into recon_summary.csv
 
+The execution site is not described here: the planner downloads it from the
+centrally hosted Pegasus site catalogs (github.com/pegasushub/pegasus-site-catalogs,
+property pegasus.catalog.site.repo.file) and jobs are planned for the site
+named "compute". The local sites.yml written here only describes the submit
+host ("local") and is merged over the downloaded catalog.
+
 Usage:
     ./workflow_generator.py --data-dir "/scratch/zhangych/Data/" \\
+        --site-catalog-file access-pegasus.yml \\
         --fold-slice-dir /home/zhangych/fold_slice --mode multislice
 """
 
@@ -37,11 +44,24 @@ logger = logging.getLogger(__name__)
 
 # Per-tool resource configuration. ptycho_recon mirrors the old sbatch file:
 # --cpus-per-task=4 --gpus-per-task=a100:1 --mem-per-gpu=40GB
+# "tag" selects the matching x-tags profiles (e.g. a GPU queue) from the
+# hosted site catalog for the compute site.
 TOOL_CONFIGS = {
-    "render_script": {"memory": "1 GB", "cores": 1, "container": True},
-    "ptycho_recon": {"memory": "40 GB", "cores": 4, "gpus": 1, "container": False},
-    "summarize": {"memory": "1 GB", "cores": 1, "container": True},
+    "render_script": {"memory": "1 GB", "cores": 1, "container": True, "tag": "cpu"},
+    "ptycho_recon": {"memory": "40 GB", "cores": 4, "gpus": 1, "container": False,
+                     "tag": "gpu"},
+    "summarize": {"memory": "1 GB", "cores": 1, "container": True, "tag": "cpu"},
 }
+
+# Site name the hosted catalogs use for the execution site
+COMPUTE_SITE = "compute"
+
+# Files in pegasushub/pegasus-site-catalogs (conf/) at the time of writing
+KNOWN_HOSTED_CATALOGS = [
+    "access-pegasus.yml", "access-pegasus-expanse.yml", "nersc-perlmutter.yml",
+    "ospool-ap40.yml", "ospool-ap41.yml", "purdue-anvil.yml", "unity.yml",
+    "usc-discovery.yml", "usc-laguna.yml",
+]
 
 TEMPLATES = {
     "multislice": "templates/Ptychography_reconstruction_multislice_template.m",
@@ -94,10 +114,25 @@ class PtychoWorkflow:
         # A GPU node occasionally dies mid-run; retry each job once
         self.props["dagman.retry"] = str(self.args.retry)
 
+        # Hosted site catalog: the planner downloads this file from
+        # github.com/pegasushub/pegasus-site-catalogs (branch = Pegasus
+        # major.minor) and merges the local sites.yml over it.
+        self.props["pegasus.catalog.site.repo.file"] = self.args.site_catalog_file
+        if self.args.site_catalog_refresh is not None:
+            self.props["pegasus.catalog.site.repo.interval"] = str(
+                self.args.site_catalog_refresh
+            )
+
+        # Site-specific overrides of the downloaded compute entry, e.g.
+        # pegasus.queue=gpu or pegasus.project=myalloc
+        for ns, key, value in self.args.site_profile:
+            self.props.add_site_profile(self.args.execution_site_name, ns, key, value)
+
     # ------------------------------------------------------------------
     # Site Catalog
     # ------------------------------------------------------------------
-    def create_sites_catalog(self, exec_site_name="condorpool"):
+    def create_sites_catalog(self):
+        """Only the submit host. The compute site comes from the hosted catalog."""
         self.sc = SiteCatalog()
 
         local = Site("local").add_directories(
@@ -113,18 +148,12 @@ class PtychoWorkflow:
             ),
         )
 
-        exec_site = (
-            Site(exec_site_name)
-            .add_condor_profile(universe="vanilla")
-            .add_pegasus_profile(style="condor")
-        )
-
-        self.sc.add_sites(local, exec_site)
+        self.sc.add_sites(local)
 
     # ------------------------------------------------------------------
     # Transformation Catalog
     # ------------------------------------------------------------------
-    def create_transformation_catalog(self, exec_site_name="condorpool"):
+    def create_transformation_catalog(self, exec_site_name=COMPUTE_SITE):
         self.tc = TransformationCatalog()
 
         # Container for the small Python steps only. ptycho_recon runs on the
@@ -154,6 +183,10 @@ class PtychoWorkflow:
             )
             if config.get("gpus"):
                 tx.add_pegasus_profile(gpus=config["gpus"])
+            if tool_name == "ptycho_recon":
+                # Walltime for batch-scheduler sites (hosted SLURM catalogs
+                # default to 30 min); the old sbatch file asked for 4 h.
+                tx.add_pegasus_profile(runtime=self.args.recon_runtime)
             transformations.append(tx)
 
             if tool_name == "ptycho_recon":
@@ -222,6 +255,7 @@ class PtychoWorkflow:
         summary_csv = File("recon_summary.csv")
         summarize_job = (
             Job("summarize", _id="summarize", node_label="summarize")
+            .add_pegasus_profile(tag=TOOL_CONFIGS["summarize"]["tag"])
             .add_args(*[a for s in summaries for a in ("--input", s)],
                       "--output", summary_csv)
             .add_inputs(*summaries)
@@ -242,6 +276,7 @@ class PtychoWorkflow:
 
         render_job = (
             Job("render_script", _id=f"render_{sid}", node_label=f"render_{sid}")
+            .add_pegasus_profile(tag=TOOL_CONFIGS["render_script"]["tag"])
             .add_args("--template", template, "--params", params, "--output", script)
             .add_inputs(template, params)
             .add_outputs(script, stage_out=True, register_replica=False)
@@ -272,6 +307,7 @@ class PtychoWorkflow:
 
         recon_job = (
             Job("ptycho_recon", _id=f"recon_{sid}", node_label=f"recon_{sid}")
+            .add_pegasus_profile(tag=TOOL_CONFIGS["ptycho_recon"]["tag"])
             .add_args(*recon_args)
             .add_inputs(*recon_inputs)
             .add_outputs(recon_tar, matlab_log, stage_out=True, register_replica=False)
@@ -299,18 +335,41 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --data-dir /scratch/zhangych/Data/ --fold-slice-dir ~/fold_slice
-  %(prog)s --data-dir /scratch/zhangych/Data/ --mode singleslice \\
-      --fold-slice-worker-path /home/zhangych/fold_slice --scans 1302 1305
+  # HTCondor pool (ACCESS Pegasus); fold_slice shipped with each job
+  %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file access-pegasus.yml \\
+      --fold-slice-dir ~/fold_slice
+
+  # SLURM cluster; fold_slice already on the shared filesystem, GPU queue override
+  %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file usc-discovery.yml \\
+      --fold-slice-worker-path /home/zhangych/fold_slice --mode singleslice \\
+      --site-profile pegasus.project=myalloc --scans 1302 1305
+
+  Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
 """,
     )
 
     # --- Standard Pegasus arguments ---
     parser.add_argument("-s", "--skip-sites-catalog", action="store_true",
-                        help="Skip site catalog creation")
+                        help="Do not write the local sites.yml (Pegasus then uses "
+                             "its default 'local' site)")
     parser.add_argument("-e", "--execution-site-name", metavar="STR", type=str,
-                        default="condorpool",
-                        help="Execution site name (default: condorpool)")
+                        default=COMPUTE_SITE,
+                        help=f"Execution site name in the hosted catalog "
+                             f"(default: {COMPUTE_SITE})")
+
+    # --- Hosted site catalog ---
+    g = parser.add_argument_group("hosted site catalog")
+    g.add_argument("--site-catalog-file", required=True, metavar="FILE",
+                   help="Hosted site catalog to download from "
+                        "github.com/pegasushub/pegasus-site-catalogs (conf/), e.g. "
+                        + ", ".join(KNOWN_HOSTED_CATALOGS))
+    g.add_argument("--site-catalog-refresh", type=int, default=None, metavar="SECONDS",
+                   help="Re-download the hosted catalog if older than this "
+                        "(Pegasus default: 1 day)")
+    g.add_argument("--site-profile", action="append", default=[],
+                   metavar="NS.KEY=VALUE",
+                   help="Override a profile of the downloaded compute site, e.g. "
+                        "pegasus.queue=gpu or pegasus.project=myalloc (repeatable)")
     parser.add_argument("-o", "--output", metavar="STR", type=str,
                         default="workflow.yml",
                         help="Output file (default: workflow.yml)")
@@ -364,6 +423,8 @@ Examples:
                    help="MATLAB executable on the workers (default: matlab)")
     g.add_argument("--recon-memory", default="40 GB",
                    help="Memory for each recon job (default: 40 GB)")
+    g.add_argument("--recon-runtime", type=int, default=14400, metavar="SECONDS",
+                   help="Walltime for each recon job on batch sites (default: 14400 = 4 h)")
     g.add_argument("--gpu-requirements", default=None,
                    help='Extra HTCondor requirements for recon jobs, '
                         'e.g. \'(GPUs_GlobalMemoryMb >= 40000)\'')
@@ -377,6 +438,21 @@ Examples:
     args = parser.parse_args()
 
     # --- Input validation (before any Pegasus API calls) ---
+    if os.path.basename(args.site_catalog_file) != args.site_catalog_file:
+        parser.error("--site-catalog-file is a file name in the hosted repository "
+                     f"(e.g. access-pegasus.yml), not a path: {args.site_catalog_file}")
+    if args.site_catalog_file not in KNOWN_HOSTED_CATALOGS:
+        logger.warning(f"{args.site_catalog_file} is not one of the hosted catalogs "
+                       f"known to this generator: {', '.join(KNOWN_HOSTED_CATALOGS)}")
+    site_profiles = []
+    for spec in args.site_profile:
+        nskey, sep, value = spec.partition("=")
+        ns, dot, key = nskey.partition(".")
+        if not sep or not dot or not ns or not key:
+            parser.error(f"--site-profile must look like NS.KEY=VALUE: {spec}")
+        site_profiles.append((ns, key, value))
+    args.site_profile = site_profiles
+
     args.data_dir = os.path.abspath(args.data_dir)
     if not os.path.isdir(args.data_dir):
         parser.error(f"--data-dir not found: {args.data_dir}")
@@ -437,7 +513,8 @@ Examples:
     for s in scans:
         logger.info(f"  {s['job_id']}")
     logger.info(f"Scans:      {len(scans)}")
-    logger.info(f"Execution site: {args.execution_site_name}")
+    logger.info(f"Execution site: {args.execution_site_name} "
+                f"(hosted catalog {args.site_catalog_file})")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
 
@@ -447,7 +524,7 @@ Examples:
         workflow.create_pegasus_properties()
 
         if not args.skip_sites_catalog:
-            workflow.create_sites_catalog(exec_site_name=args.execution_site_name)
+            workflow.create_sites_catalog()
 
         workflow.create_transformation_catalog(exec_site_name=args.execution_site_name)
         workflow.create_replica_catalog()
