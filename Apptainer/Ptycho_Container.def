@@ -1,0 +1,26 @@
+# Container for the Python steps of the ptycho workflow (render_script,
+# summarize). Both use only the Python standard library.
+#
+# The reconstruction step (ptycho_recon) deliberately does NOT run in this
+# container: it needs the site's licensed MATLAB (module load matlab/...) and
+# the GPU driver stack, so it runs directly on the GPU worker.
+#
+# Build:
+#   apptainer build Ptycho_Container.sif Apptainer/Ptycho_Container.def
+
+Bootstrap: docker
+From: python:3.12-slim
+
+%post
+    # Nothing beyond the standard library is required today. Add packages
+    # here if a wrapper grows dependencies (e.g. h5py for result previews).
+    python3 --version
+
+%environment
+    # Set Python to not buffer output (important for Pegasus log capture)
+    export PYTHONUNBUFFERED=1
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+
+%runscript
+    exec /bin/bash "$@"
