@@ -30,7 +30,7 @@ scan folders ───────────┘
 ## Directory Structure
 
 ```
-ptycho-workflow/
+pegasus-ptycho/
 ├── workflow_generator.py        # Pegasus workflow generator
 ├── ptycho_params.py             # Spreadsheet -> per-scan parameters (also a CLI)
 ├── bin/
@@ -71,7 +71,7 @@ the container, and they need nothing beyond the Python standard library.
 ### 1. Build the Apptainer container
 
 ```bash
-cd ptycho-workflow
+cd pegasus-ptycho
 apptainer build Ptycho_Container.sif Apptainer/Ptycho_Container.def
 ```
 
