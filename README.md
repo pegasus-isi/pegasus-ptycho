@@ -55,7 +55,7 @@ pegasus-ptycho/
 - A compute resource described by one of the hosted site catalogs (an HTCondor pool or a SLURM cluster), with GPUs. On the GPU workers:
   - MATLAB with the Parallel Computing Toolbox, through `module load matlab/2021b` or on `PATH`
   - `python3`
-- A fold_slice checkout
+- A fold_slice checkout on a filesystem shared by the GPU workers
 
 No container is used. MATLAB needs a license, so `ptycho_recon` runs directly
 on the GPU worker and loads MATLAB exactly as the old sbatch file did.
@@ -129,9 +129,10 @@ provide it:
 | `usc-discovery.yml`, `usc-laguna.yml`, `unity.yml`, `purdue-anvil.yml` | SLURM clusters (direct submission) |
 | `nersc-perlmutter.yml` | NERSC Perlmutter (SFAPI) |
 
-**fold_slice.** By default `--fold-slice-dir` is copied into every recon job
-by HTCondor, which suits HTCondor pools. On a SLURM cluster where the workers
-share a filesystem with it, add `--fold-slice-shared` to use it in place.
+**fold_slice.** `--fold-slice-dir` is the absolute path of fold_slice on the
+workers' shared filesystem. Pegasus does not transfer it: like
+`param_config_multislice.py`, the generator writes the path into each MATLAB
+script, so it must exist at that path on every worker.
 
 ## Usage
 
@@ -145,14 +146,14 @@ share a filesystem with it, add `--fold-slice-shared` to use it in place.
     --mode multislice
 ```
 
-On a SLURM cluster with fold_slice on the shared filesystem:
+On a SLURM cluster:
 
 ```bash
 export RESOURCE_PROJECT=myalloc
 ./workflow_generator.py \
     --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" \
     --site-catalog-file usc-discovery.yml \
-    --fold-slice-dir /home/zhangych/fold_slice --fold-slice-shared
+    --fold-slice-dir /home/zhangych/fold_slice
 ```
 
 This writes `workflow.yml` and the catalogs to the current directory, and the
@@ -165,8 +166,7 @@ those scripts before planning, the same way as the old `Scripts/` folder.
 |--------|---------|-------------|
 | `--data-dir` | (required) | Experiment folder |
 | `--site-catalog-file` | (required) | Hosted site catalog file name, e.g. `access-pegasus.yml` |
-| `--fold-slice-dir` | (required) | fold_slice directory |
-| `--fold-slice-shared` | off | fold_slice already exists at that path on every worker; don't transfer it |
+| `--fold-slice-dir` | (required) | Absolute path of fold_slice on the workers' shared filesystem |
 | `--bg-file` | `<data-dir>/Background subtraction.mat` | Background file for rows with background subtraction = 1 |
 | `--mode` | `multislice` | `multislice` or `singleslice` template |
 | `-e`, `--execution-site-name` | `compute` | Execution site name |
@@ -205,13 +205,10 @@ data stays on the worker. It is not staged back.
 ## How the template is adapted to Pegasus
 
 Pegasus runs each job in its own scratch directory, so the hard-coded
-`/home/...` paths in the templates cannot be used. The generator renders two
-placeholders into each script, and `ptycho_recon.py` resolves them on the worker:
-
-| Template variable | Rendered as | Resolved on the worker to |
-|-------------------|-------------|---------------------------|
-| `exp_dir` | `__PEGASUS_JOB_DIR__/` | the job directory |
-| `cSAXS_matlab_path`, `ptycho_matlab_path` | `__FOLD_SLICE_DIR__[/ptycho]` | the transferred (or shared) fold_slice |
+`exp_dir` in the templates cannot be a fixed path. The generator renders it as
+the placeholder `__PEGASUS_JOB_DIR__/`, and `ptycho_recon.py` replaces that with
+the job directory on the worker. `cSAXS_matlab_path` and `ptycho_matlab_path`
+are rendered directly from `--fold-slice-dir` (`<dir>` and `<dir>/ptycho`).
 
 The raw file is registered as a **deep LFN**,
 `Data/<scan folder>/scan_xN_yN.raw`. That is the path the template reads
@@ -235,7 +232,8 @@ Nothing else in the templates was changed. As in `param_config`, the
 
 This generates the workflow and renders the scripts, and runs anywhere. To also run the
 MATLAB reconstruction, run it on a GPU node with MATLAB and add
-`--fold-slice /path/to/fold_slice --matlab-module matlab/2021b`.
+`--fold-slice /path/to/fold_slice --matlab-module matlab/2021b`, where the
+path is where fold_slice lives on that node.
 
 The bundled `Sample dataset` has no `Background subtraction.mat`, so pass
 one with `--bg-file` or its scan 1302 is skipped. Its scan 0102 has no raw file.
@@ -246,8 +244,8 @@ one with `--bg-file` or its scan 1302 is skipped. Its scan 0102 has no raw file.
 |------|--------|-------|------|---------|
 | ptycho_recon | 40 GB | 4 | 1 | 4 h |
 
-Each recon job receives one raw file (about 1 GB for a 128×128 scan) and,
-without `--fold-slice-shared`, a copy of fold_slice.
+Each recon job receives one raw file (about 1 GB for a 128×128 scan).
+fold_slice is read in place from the shared filesystem.
 
 ## Dependencies
 

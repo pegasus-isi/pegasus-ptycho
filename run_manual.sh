@@ -92,16 +92,12 @@ mkdir -p "${OUTPUT_DIR}"
 # ==============================================================
 log_step "0. workflow_generator.py"
 
-if [ -n "${FOLD_SLICE}" ]; then
-    FS_ARGS=(--fold-slice-dir "${FOLD_SLICE}")
-else
-    # Only written into the catalogs; nothing is transferred in this test
-    FS_ARGS=(--fold-slice-dir /path/to/fold_slice --fold-slice-shared)
-fi
+# Written into the MATLAB scripts; a placeholder when MATLAB isn't run
+FS_DIR="${FOLD_SLICE:-/path/to/fold_slice}"
 
 ( cd "${OUTPUT_DIR}" && python3 "${SCRIPT_DIR}/workflow_generator.py" \
     --data-dir "${DATA_DIR}" --mode "${MODE}" \
-    --site-catalog-file access-pegasus.yml --bg-file "${BG_FILE}" "${FS_ARGS[@]}" )
+    --site-catalog-file access-pegasus.yml --bg-file "${BG_FILE}" --fold-slice-dir "${FS_DIR}" )
 
 check_file "${OUTPUT_DIR}/workflow.yml" "Workflow generated"
 
@@ -144,7 +140,6 @@ else
     RECON_ARGS=(
         --script "$(basename "${SCRIPT}")"
         --raw "Data/${SCAN_FOLDER}/$(basename "${RAW}")"
-        --fold-slice "${FOLD_SLICE}"
         --matlab-module "${MATLAB_MODULE}"
         --output-tar "${JOB_ID}/${JOB_ID}_recon.tar.gz"
         --log "${JOB_ID}/${JOB_ID}_matlab.log"

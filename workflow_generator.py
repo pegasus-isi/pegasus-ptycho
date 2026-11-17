@@ -16,7 +16,7 @@ pegasus.catalog.site.repo.file); jobs are planned for the site "compute".
 
 Usage:
     ./workflow_generator.py --data-dir "/scratch/zhangych/Data/" \\
-        --site-catalog-file access-pegasus.yml --fold-slice-dir ~/fold_slice
+        --site-catalog-file access-pegasus.yml --fold-slice-dir /home/zhangych/fold_slice
 """
 
 import argparse
@@ -58,9 +58,9 @@ MULTISLICE_DEFAULTS = {
 
 COMPUTE_SITE = "compute"
 
-# Placeholders for paths only known on the worker; resolved by ptycho_recon.py
+# Placeholder for the job directory, only known on the worker; resolved by
+# ptycho_recon.py
 JOB_DIR_TOKEN = "__PEGASUS_JOB_DIR__"
-FOLD_SLICE_TOKEN = "__FOLD_SLICE_DIR__"
 
 # Sheet columns. The current sheets have 28 columns; a 32-column sheet also
 # has the four multislice columns after initial_probe.
@@ -226,11 +226,6 @@ class PtychoWorkflow:
             is_stageable=True,
         ).add_pegasus_profile(**RECON_RESOURCES)
 
-        if not self.args.fold_slice_shared:
-            # CondorIO: HTCondor copies fold_slice into each job directory
-            ptycho_recon.add_profiles(Namespace.CONDOR, key="transfer_input_files",
-                                      value=self.args.fold_slice_dir)
-
         self.tc.add_transformations(ptycho_recon)
 
     # ------------------------------------------------------------------
@@ -318,8 +313,8 @@ class PtychoWorkflow:
                     "GPU_solver": row["GPU_solver"],
                     "errmetric": row["errmetric"],
                     "initial_probe": int(row["initial_probe"]),
-                    "cSAXS_matlab_path": FOLD_SLICE_TOKEN,
-                    "ptycho_matlab_path": f"{FOLD_SLICE_TOKEN}/ptycho",
+                    "cSAXS_matlab_path": self.args.fold_slice_dir,
+                    "ptycho_matlab_path": f"{self.args.fold_slice_dir}/ptycho",
                 }
                 replace_vars = list(REPLACE_VARS)
                 if mode == "multislice":
@@ -373,7 +368,6 @@ class PtychoWorkflow:
             Job("ptycho_recon", _id=f"recon_{job_id}", node_label=f"recon_{job_id}")
             .add_pegasus_profile(tag=RECON_TAG)
             .add_args("--script", script, "--raw", raw,
-                      "--fold-slice", self.args.fold_slice_arg,
                       "--matlab-module", MATLAB_MODULE,
                       "--output-tar", recon_tar, "--log", matlab_log)
             .add_inputs(script, raw)
@@ -406,9 +400,9 @@ def main():
         epilog="""
 Examples:
   %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file access-pegasus.yml \\
-      --fold-slice-dir ~/fold_slice
+      --fold-slice-dir /home/zhangych/fold_slice
   %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file usc-discovery.yml \\
-      --fold-slice-dir /home/zhangych/fold_slice --fold-slice-shared --mode singleslice
+      --fold-slice-dir /home/zhangych/fold_slice --mode singleslice
 
 Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
 """,
@@ -432,9 +426,8 @@ Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
                         help="Hosted site catalog (pegasushub/pegasus-site-catalogs conf/), "
                              "e.g. access-pegasus.yml, usc-discovery.yml")
     parser.add_argument("--fold-slice-dir", required=True,
-                        help="fold_slice directory (sent to each job unless --fold-slice-shared)")
-    parser.add_argument("--fold-slice-shared", action="store_true",
-                        help="--fold-slice-dir already exists on every worker; don't transfer it")
+                        help="fold_slice directory on the workers' shared filesystem "
+                             "(written into the MATLAB scripts)")
     parser.add_argument("--bg-file", default=None,
                         help='Background file (default: <data-dir>/"Background subtraction.mat")')
     parser.add_argument("--mode", choices=sorted(TEMPLATES), default="multislice",
@@ -452,13 +445,11 @@ Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
                        "background_subtraction=1 will be skipped (use --bg-file)")
     if not os.path.isfile(args.params_xlsx):
         parser.error(f"not found: {args.params_xlsx}")
-    if not args.fold_slice_shared:
-        args.fold_slice_dir = os.path.abspath(args.fold_slice_dir.rstrip("/"))
-        if not os.path.isdir(os.path.join(args.fold_slice_dir, "ptycho")):
-            parser.error(f"--fold-slice-dir has no ptycho/ subfolder: {args.fold_slice_dir}")
-    # What the job is told: the transferred copy's name, or the worker path
-    args.fold_slice_arg = (args.fold_slice_dir if args.fold_slice_shared
-                           else os.path.basename(args.fold_slice_dir))
+    # A path on the workers, so it is not checked here
+    args.fold_slice_dir = args.fold_slice_dir.rstrip("/")
+    if not os.path.isabs(args.fold_slice_dir):
+        parser.error(f"--fold-slice-dir must be an absolute path on the workers: "
+                     f"{args.fold_slice_dir}")
 
     logger.info("=" * 70)
     logger.info("PTYCHO WORKFLOW GENERATOR")

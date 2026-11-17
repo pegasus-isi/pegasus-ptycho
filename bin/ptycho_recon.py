@@ -8,7 +8,7 @@ sbatch file. Pegasus stages the rendered script, the raw 4D-STEM file and
 this wrapper lays them out the way the MATLAB template expects:
 
     <job dir>/
-        run_<scan>.m                               (placeholders resolved)
+        run_<scan>.m                               (job dir placeholder resolved)
         Background subtraction.mat                 -> staged background file
         Data/<scan folder>/scan_xN_yN.raw          staged raw file (deep LFN)
         Recon_files/<scan folder>/init_recon.mat   -> staged previous recon
@@ -32,7 +32,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 JOB_DIR_TOKEN = "__PEGASUS_JOB_DIR__"
-FOLD_SLICE_TOKEN = "__FOLD_SLICE_DIR__"
 
 
 def link(src, dst):
@@ -61,9 +60,6 @@ def main():
                         help="Staged 'Background subtraction.mat'")
     parser.add_argument("--init-recon", default=None,
                         help="Staged previous reconstruction (initial_probe=1)")
-    parser.add_argument("--fold-slice", required=True,
-                        help="fold_slice directory: a name transferred into the "
-                             "job dir by HTCondor, or an absolute path on the worker")
     parser.add_argument("--matlab-module", default="",
                         help="Environment module to load first (e.g. matlab/2021b)")
     parser.add_argument("--output-tar", required=True, help="Recon_result tarball")
@@ -73,11 +69,6 @@ def main():
     job_dir = os.getcwd()
     script_name = os.path.splitext(os.path.basename(args.script))[0]
     logger.info(f"Scan: {script_name}  (job dir {job_dir})")
-
-    fold_slice = os.path.abspath(args.fold_slice)
-    if not os.path.isdir(os.path.join(fold_slice, "ptycho")):
-        logger.error(f"fold_slice not found (no ptycho/ under {fold_slice})")
-        sys.exit(1)
 
     # --- Lay out inputs where the template expects them -----------------
     # The raw file is already in place: its deep LFN is the path the template
@@ -91,10 +82,10 @@ def main():
     if args.init_recon:
         link(args.init_recon, os.path.join("Recon_files", scan_folder, "init_recon.mat"))
 
-    # --- Resolve worker-side placeholders -------------------------------
+    # --- Resolve the job directory placeholder ---------------------------
     with open(args.script, encoding="utf-8") as f:
         text = f.read()
-    text = text.replace(FOLD_SLICE_TOKEN, fold_slice).replace(JOB_DIR_TOKEN, job_dir)
+    text = text.replace(JOB_DIR_TOKEN, job_dir)
     os.remove(args.script)  # the staged copy may be a link to the submit host
     with open(args.script, "w", encoding="utf-8") as f:
         f.write(text)
