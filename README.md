@@ -2,94 +2,68 @@
 
 A [Pegasus WMS](https://pegasus.isi.edu/) workflow for batch electron
 ptychography reconstruction with [fold_slice](https://github.com/yijiang1/fold_slice)
-(PtychoShelves). It replaces the `param_config_multislice.py` + per-scan
+(PtychoShelves). It replaces `param_config_multislice.py` and the per-scan
 `sbatch` routine. Every scan in an experiment folder that has a row in
-`Ptycho parameters.xlsx` becomes one branch of a single DAG. Pegasus stages the
-data, runs the reconstructions in parallel on GPU nodes, retries failures, and
-brings the results back.
+`Ptycho parameters.xlsx` becomes one GPU job. Pegasus stages the data, runs
+the reconstructions in parallel, retries failures, and brings the results back.
 
 ## Pipeline Overview
 
 ```
 Ptycho parameters.xlsx ─┐   workflow_generator.py
-rbf.xlsx ───────────────┼──> (generation time) ──> scripts/run_<scan A>.m ...
+rbf.xlsx ───────────────┼──> (generation time) ──> Scripts/run_<scan>_Scan<n>.m
 MATLAB template ────────┤
 scan folders ───────────┘
-                                        │
-        ┌───────────────────────────────┘   (workflow)
-        ├── ptycho_recon(scan A, GPU) ──┐
-        ├── ptycho_recon(scan B, GPU) ──┼──> summarize ──> recon_summary.csv
-        └── ptycho_recon(scan N, GPU) ──┘
+                                        │   (workflow)
+        ┌───────────────────────────────┤
+        ├── ptycho_recon(scan A, GPU) ──> <scan A>_recon.tar.gz, <scan A>_matlab.log
+        ├── ptycho_recon(scan B, GPU) ──> ...
+        └── ptycho_recon(scan N, GPU) ──> ...
 ```
+
+`workflow_generator.py` follows `param_config_multislice.py` step for step.
+It uses the same lookup functions (`get_rbf`, `get_ADU`, `get_alpha0`,
+`get_scan_step_size`), the same loop over scan folders and sheet rows, and the
+same regex replacement to write `Scripts/run_<scan>_Scan<n>.m`. Where the old
+script added a line to an sbatch file, the generator adds a Pegasus job. The
+jobs are independent, exactly like the old per-scan `srun` lines.
 
 | Step | Tool | Description |
 |------|------|-------------|
-| 0. (generation time) | `ptycho_params.py` (pandas) | Reads the parameters and rbf sheets, works out ADU, alpha0, rbf and scan step size for each scan, and renders `scripts/run_<scan>.m` from the MATLAB template with the same regex replacement as `param_config_multislice.py`. |
-| 1. ptycho_recon | host MATLAB + fold_slice, 1 GPU | Lays out the staged inputs as the template expects, runs `matlab -batch run_<scan>`, and packs `Recon_result/` into a tarball. |
-| 2. summarize | Python | Combines the per-scan summaries into one CSV. |
-
-Rendering happens while generating, as `param_config` did, rather than as a
-job. It needs only the template and the spreadsheet, takes milliseconds, and
-as a job it would add one scheduled (on SLURM: queued) job per scan. Template
-problems also show up before anything is submitted. You can look at or diff
-`scripts/run_*.m` before planning, the same way you checked the old
-`Scripts/` folder.
+| ptycho_recon | host MATLAB + fold_slice, 1 GPU | Lays out the staged inputs as the template expects, runs `matlab -batch run_<scan>`, and packs `Recon_result/` into a tarball. |
 
 ## Directory Structure
 
 ```
 pegasus-ptycho/
-├── workflow_generator.py        # Pegasus workflow generator
-├── ptycho_params.py             # Spreadsheet -> per-scan parameters + MATLAB scripts (also a CLI)
+├── workflow_generator.py        # Pegasus workflow generator (param_config logic + catalogs)
 ├── bin/
-│   ├── ptycho_recon.py          # MATLAB/GPU reconstruction wrapper
-│   └── summarize.py             # Fan-in: recon_summary.csv
+│   └── ptycho_recon.py          # MATLAB/GPU reconstruction wrapper
 ├── templates/
 │   ├── Ptychography_reconstruction_multislice_template.m
 │   └── Ptychography_reconstruction_singleslice_template.m
 ├── config/
 │   └── rbf.xlsx                 # rbf calibration (voltage, camera length, conv. angle)
-├── Apptainer/
-│   └── Ptycho_Container.def     # Container for the summarize step
-├── run_manual.sh                # Step-by-step local test
+├── run_manual.sh                # Local test
 └── README.md
 ```
 
 ## Prerequisites
 
-- [Pegasus WMS](https://pegasus.isi.edu/) >= 5.1.3 and [HTCondor](https://htcondor.org/) >= 10.2 on the submit host
+- [Pegasus WMS](https://pegasus.isi.edu/) >= 5.1.3 and [HTCondor](https://htcondor.org/) >= 10.2 on the submit host. 5.1.3 is the first release with [hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs) and job tagging. The planner also needs outbound HTTPS to GitHub.
 - Python 3.8+ with `pandas` and `openpyxl` on the submit host (the generator reads the `.xlsx` files)
-- Pegasus >= 5.1.3 for [hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs) and job tagging. The planner also needs outbound HTTPS to GitHub.
-- A compute resource described by one of the hosted site catalogs (an HTCondor pool, or a SLURM cluster), with GPUs. On the GPU workers:
-  - MATLAB with the Parallel Computing Toolbox, either through `module load matlab/2021b` or on `PATH`
-  - `python3` (the recon wrapper runs on the host, not in a container)
+- A compute resource described by one of the hosted site catalogs (an HTCondor pool or a SLURM cluster), with GPUs. On the GPU workers:
+  - MATLAB with the Parallel Computing Toolbox, through `module load matlab/2021b` or on `PATH`
+  - `python3`
 - A fold_slice checkout
-- [Apptainer](https://apptainer.org/), to build the small container for the summarize step (optional, see `--no-container`)
 
-### Why MATLAB runs on the host
+No container is used. MATLAB needs a license, so `ptycho_recon` runs directly
+on the GPU worker and loads MATLAB exactly as the old sbatch file did.
 
-MATLAB needs a license, so it cannot be baked into a container the way pip
-tools can. `ptycho_recon` runs directly on the GPU worker and loads MATLAB
-exactly as the old sbatch file did. Only `summarize` uses the container, and
-it needs nothing beyond the Python standard library.
+## Prepare the experiment folder
 
-## Setup
-
-### 1. Build the Apptainer container
-
-```bash
-cd pegasus-ptycho
-apptainer build Ptycho_Container.sif Apptainer/Ptycho_Container.def
-```
-
-The generator looks for `./Ptycho_Container.sif` by default. Use
-`--container-image` to point it elsewhere, or `--no-container` to run
-`summarize` with the workers' own `python3` (then there is nothing to build).
-
-### 2. Prepare the experiment folder
-
-The folder layout is the same one `param_config_multislice.py` expects (the
-Zaratan layout, with scan folders directly inside it; a `Data/` sub-folder also works):
+The layout is the one `param_config_multislice.py` expects, with scan folders
+directly inside the experiment folder:
 
 ```
 <experiment>/
@@ -102,33 +76,51 @@ Zaratan layout, with scan folders directly inside it; a `Data/` sub-folder also 
     └── scan_x128_y128.raw
 ```
 
-- **Scan folders** are the sub-folders whose name starts with the
-  acquisition time (`1302_...`). Each folder is matched to the sheet rows
-  with the same *Acqu. Time*. If several rows share a time, they become
-  `Scan1`, `Scan2`, ... as before.
-- **Sheet layouts.** A 28-column sheet (the current single-slice layout, as
-  in `Ptycho parameters template.xlsx`) and a 32-column multislice sheet (with
-  `previous_object`, `regularization`, `thickness` and `Nlayers` after
-  *Previous initial probe*) are both accepted. With a 28-column sheet in
-  multislice mode, those four values come from `--previous-object`,
-  `--regularization`, `--thickness` and `--nlayers`.
+- **Scan folders** are the sub-folders whose name starts with the acquisition
+  time (`1302_...`). Each is matched to the sheet rows with the same
+  *Acqu. Time*. If several rows share a time, they become `Scan1`, `Scan2`, ...
+- **Skipped scans.** As in `param_config`, problems are printed and the scan
+  is skipped. Examples: no sheet row, an unknown voltage / camera length /
+  convergence angle, an empty scan size, a missing raw file, or
+  no background file (`<experiment>/Background subtraction.mat`, or
+  `--bg-file`) for a row that needs it.
+- **Sheet layout.** The current 28-column sheets have no multislice columns.
+  In multislice mode, `previous_object`, `regularization`, `thickness` and
+  `Nlayers` then come from `MULTISLICE_DEFAULTS` at the top of
+  `workflow_generator.py`. A 32-column sheet with those four columns after
+  *Previous initial probe* is read directly.
+
+## Settings
+
+As with `code_dir` in `param_config` and the partition and time settings in
+the old submit script, the settings that rarely change are constants at the
+top of `workflow_generator.py`:
+
+| Constant | Default | Meaning |
+|----------|---------|---------|
+| `TEMPLATES` | `templates/...` | MATLAB template per `--mode` |
+| `RBF_XLSX` | `config/rbf.xlsx` | rbf calibration table |
+| `MATLAB_MODULE` | `matlab/2021b` | Module loaded before MATLAB (`''` if `matlab` is on `PATH`) |
+| `RECON_RESOURCES` | 40 GB, 4 cores, 1 GPU, 14400 s | Per recon job, as in the old sbatch file |
+| `RECON_TAG` | `gpu` | Job tag that selects the hosted catalog's GPU profiles |
+| `MULTISLICE_DEFAULTS` | `0`, `0.1`, `13`, `2` | previous_object, regularization, thickness, Nlayers |
 
 ## Execution site: hosted site catalogs
 
-The generator does not describe the execution site itself. It uses Pegasus'
-[centrally hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs):
+The execution site is not described in this repository. Pegasus'
+[centrally hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs)
+provide it:
 
 - `--site-catalog-file` sets `pegasus.catalog.site.repo.file`. At plan time,
   the planner downloads that file from
   [pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf),
-  from the branch matching its own major.minor version (e.g. `6.0`). It saves
-  the file next to `workflow.yml` and downloads it again once it is more than
-  a day old.
-- Jobs are planned for the site named **`compute`**, the name every hosted
-  catalog uses for its execution site.
-- The `sites.yml` the generator writes describes only the submit host
-  (`local`: `scratch/` and `output/`). Pegasus merges it over the downloaded
-  catalog, and local entries win.
+  from the branch matching its major.minor version (e.g. `6.0`).
+- Jobs are planned for the site named **`compute`**.
+- The local `sites.yml` describes only the submit host (`local`: `scratch/`
+  and `output/`). Pegasus merges it over the downloaded catalog.
+- Recon jobs are tagged `gpu`, so a catalog's GPU `x-tags` (e.g. a `gpu`
+  queue) apply. Several catalogs read `${RESOURCE_PROJECT}` from the
+  environment when planning.
 
 | Hosted file | Resource |
 |-------------|----------|
@@ -137,26 +129,9 @@ The generator does not describe the execution site itself. It uses Pegasus'
 | `usc-discovery.yml`, `usc-laguna.yml`, `unity.yml`, `purdue-anvil.yml` | SLURM clusters (direct submission) |
 | `nersc-perlmutter.yml` | NERSC Perlmutter (SFAPI) |
 
-**Job tags.** `ptycho_recon` jobs are tagged `gpu`, and the `summarize` job
-is tagged `cpu`. When the hosted entry has `x-tags`, the
-planner adds that tag's profiles. With `usc-discovery.yml`, for example,
-recon jobs go to the `gpu` queue and `summarize` stays on `main`.
-Resources set in the transformation catalog take precedence over the site
-catalog. Recon jobs always ask for 4 cores, 1 GPU, `--recon-memory` (40 GB)
-and `--recon-runtime` (4 h). The runtime matters on SLURM catalogs, which
-otherwise default to 30 minutes.
-
-**Overriding the hosted entry.** Use `--site-profile NS.KEY=VALUE`
-(repeatable). Each one becomes a
-`pegasus.catalog.site.sites.compute.profiles.NS.KEY` property, e.g.
-`--site-profile pegasus.project=myalloc` or `--site-profile pegasus.queue=gpu-a100`.
-Several hosted catalogs read `${RESOURCE_PROJECT}` from the environment when
-planning, so set that variable as well when your catalog uses it.
-
-**fold_slice on batch clusters.** `--fold-slice-dir` ships fold_slice through
-HTCondor file transfer, which suits HTCondor pools (access-pegasus, ospool).
-On SLURM catalogs, the workers usually share a filesystem with your home
-directory, so use `--fold-slice-worker-path` instead.
+**fold_slice.** By default `--fold-slice-dir` is copied into every recon job
+by HTCondor, which suits HTCondor pools. On a SLURM cluster where the workers
+share a filesystem with it, add `--fold-slice-shared` to use it in place.
 
 ## Usage
 
@@ -167,40 +142,22 @@ directory, so use `--fold-slice-worker-path` instead.
     --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" \
     --site-catalog-file access-pegasus.yml \
     --fold-slice-dir /home/zhangych/fold_slice \
-    --mode multislice \
-    --output workflow.yml
+    --mode multislice
 ```
 
-On a SLURM cluster with a hosted catalog, with fold_slice already on the
-shared filesystem:
+On a SLURM cluster with fold_slice on the shared filesystem:
 
 ```bash
 export RESOURCE_PROJECT=myalloc
 ./workflow_generator.py \
     --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" \
     --site-catalog-file usc-discovery.yml \
-    --fold-slice-worker-path /home/zhangych/fold_slice \
-    --site-profile pegasus.project=myalloc \
-    --output workflow.yml
+    --fold-slice-dir /home/zhangych/fold_slice --fold-slice-shared
 ```
 
-To try it on the bundled sample dataset (which has no
-`Background subtraction.mat`, and whose scan 0102 has no raw file):
-
-```bash
-./workflow_generator.py \
-    --data-dir "../Ptycho cluster script/Sample dataset" \
-    --site-catalog-file access-pegasus.yml \
-    --fold-slice-dir /home/zhangych/fold_slice \
-    --bg-file "/path/to/Background subtraction.mat" \
-    --skip-missing \
-    --output workflow.yml
-```
-
-The generator checks every scan before it writes anything. A missing raw file,
-an unknown voltage / camera length / convergence angle combination, an empty
-scan size, or a missing background file stops generation with a list of the
-problems. `--skip-missing` drops those scans and continues.
+This writes `workflow.yml` and the catalogs to the current directory, and the
+rendered MATLAB scripts to `Scripts/` next to the generator. Check or diff
+those scripts before planning, the same way as the old `Scripts/` folder.
 
 ### CLI options
 
@@ -208,29 +165,12 @@ problems. `--skip-missing` drops those scans and continues.
 |--------|---------|-------------|
 | `--data-dir` | (required) | Experiment folder |
 | `--site-catalog-file` | (required) | Hosted site catalog file name, e.g. `access-pegasus.yml` |
-| `--site-profile` | none | Override a profile of the hosted `compute` site, `NS.KEY=VALUE` (repeatable) |
-| `--site-catalog-refresh` | 1 day | Re-download the hosted catalog when older than this many seconds |
-| `--fold-slice-dir` | one of the two is required | fold_slice on the submit host, transferred to each recon job by HTCondor |
-| `--fold-slice-worker-path` | | fold_slice already present on every worker (shared FS); nothing is transferred |
+| `--fold-slice-dir` | (required) | fold_slice directory |
+| `--fold-slice-shared` | off | fold_slice already exists at that path on every worker; don't transfer it |
+| `--bg-file` | `<data-dir>/Background subtraction.mat` | Background file for rows with background subtraction = 1 |
 | `--mode` | `multislice` | `multislice` or `singleslice` template |
-| `--template` | per `--mode` | Use a different MATLAB template |
-| `--params-xlsx` | `<data-dir>/Ptycho parameters.xlsx` | Parameters sheet |
-| `--rbf-xlsx` | `config/rbf.xlsx` | rbf calibration table |
-| `--bg-file` | `<data-dir>/Background subtraction.mat` | Background file |
-| `--scans` | all | Only these acquisition times, e.g. `--scans 1302 1305` |
-| `--skip-missing` | off | Skip invalid scans instead of failing |
-| `--regularization` / `--thickness` / `--nlayers` / `--previous-object` | `0.1` / `13` / `2` / `0` | Multislice values used when the sheet lacks those columns |
-| `--matlab-module` | `matlab/2021b` | Module to load before MATLAB; `''` to skip |
-| `--matlab-cmd` | `matlab` | MATLAB executable |
-| `--recon-memory` | `40 GB` | Memory per recon job |
-| `--recon-runtime` | `14400` | Walltime per recon job in seconds (batch sites) |
-| `--gpu-requirements` | none | Extra HTCondor `requirements`, e.g. `'(GPUs_GlobalMemoryMb >= 40000)'` |
-| `--container-image` | `./Ptycho_Container.sif` | Container for `summarize` |
-| `--no-container` | off | Run `summarize` without a container |
-| `--retry` | `1` | DAGMan retries per job |
-| `--output-dir` | `./output` | Where final outputs are staged |
-| `-e`, `--execution-site-name` | `compute` | Execution site name in the hosted catalog |
-| `-s`, `--skip-sites-catalog` | off | Don't write the local `sites.yml` (Pegasus then uses its default `local` site) |
+| `-e`, `--execution-site-name` | `compute` | Execution site name |
+| `-s`, `--skip-sites-catalog` | off | Don't write the local `sites.yml` |
 | `-o`, `--output` | `workflow.yml` | Output workflow file |
 
 ### Plan and submit
@@ -252,15 +192,12 @@ MATLAB log.
 
 ## Outputs
 
-The rendered scripts stay in `scripts/` next to the generator, and a copy with
-worker paths filled in is inside each tarball. Final outputs are staged to
-`output/`:
+Final outputs are staged to `output/`:
 
 | Output | Description |
 |--------|-------------|
 | `<scan>_Scan<n>/<scan>_Scan<n>_recon.tar.gz` | The whole `Recon_result/` tree: `init_probe_*.mat`, `*_params.mat`, the `Reduced_run_*` / `Full_run_*` iterations, and the script with paths resolved. |
 | `<scan>_Scan<n>/<scan>_Scan<n>_matlab.log` | MATLAB stdout/stderr (the old `Log/Data_<scan>.txt`). |
-| `recon_summary.csv` | One row per scan: runtime, host, solver, Niter, layers, and `Full_run` files. |
 
 The intermediate `data_roi*_dp.hdf5` that the template writes next to the raw
 data stays on the worker. It is not staged back.
@@ -274,7 +211,7 @@ placeholders into each script, and `ptycho_recon.py` resolves them on the worker
 | Template variable | Rendered as | Resolved on the worker to |
 |-------------------|-------------|---------------------------|
 | `exp_dir` | `__PEGASUS_JOB_DIR__/` | the job directory |
-| `cSAXS_matlab_path`, `ptycho_matlab_path` | `__FOLD_SLICE_DIR__[/ptycho]` | the transferred (or worker-local) fold_slice |
+| `cSAXS_matlab_path`, `ptycho_matlab_path` | `__FOLD_SLICE_DIR__[/ptycho]` | the transferred (or shared) fold_slice |
 
 Before starting MATLAB, the wrapper links the staged inputs to the paths the
 template reads: `Data/<scan folder>/scan_xN_yN.raw`,
@@ -285,26 +222,26 @@ Nothing else in the templates was changed. As in `param_config`, the
 ## Testing locally
 
 ```bash
-./run_manual.sh --data-dir "../Ptycho cluster script/Sample dataset" --scan 1302
+./run_manual.sh --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" --scan 1302
 ```
 
-This runs the spreadsheet parsing, script rendering and `summarize` anywhere.
-To also run the MATLAB reconstruction, run it on a GPU node with MATLAB and add
+This generates the workflow and renders the scripts, and runs anywhere. To also run the
+MATLAB reconstruction, run it on a GPU node with MATLAB and add
 `--fold-slice /path/to/fold_slice --matlab-module matlab/2021b`.
+
+The bundled `Sample dataset` has no `Background subtraction.mat`, so pass
+one with `--bg-file` or its scan 1302 is skipped. Its scan 0102 has no raw file.
 
 ## Resource Requirements
 
-| Step | Memory | Cores | GPUs |
-|------|--------|-------|------|
-| ptycho_recon | 40 GB (`--recon-memory`) | 4 | 1 |
-| summarize | 1 GB | 1 | 0 |
+| Step | Memory | Cores | GPUs | Runtime |
+|------|--------|-------|------|---------|
+| ptycho_recon | 40 GB | 4 | 1 | 4 h |
 
-Each recon job receives one raw file (about 1 GB for a 128×128 scan) and, with
-`--fold-slice-dir`, a copy of fold_slice. If the workers share a filesystem
-with fold_slice on it, use `--fold-slice-worker-path` to skip that copy.
+Each recon job receives one raw file (about 1 GB for a 128×128 scan) and,
+without `--fold-slice-shared`, a copy of fold_slice.
 
 ## Dependencies
 
 - Submit host: Pegasus >= 5.1.3, HTCondor, Python 3 with `pandas`, `openpyxl`
-- GPU workers: MATLAB (R2021b tested by the original scripts) with the Parallel Computing Toolbox, CUDA-capable GPU, `python3`
-- Container (`python:3.12-slim`): Python standard library only
+- GPU workers: MATLAB (R2021b, as in the original scripts) with the Parallel Computing Toolbox, CUDA-capable GPU, `python3`

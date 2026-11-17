@@ -3,41 +3,30 @@
 """
 Pegasus workflow generator for electron ptychography reconstruction.
 
-Replaces the param_config_multislice.py + sbatch pair: instead of writing one
-MATLAB script and one sbatch file per scan and submitting them by hand, every
-scan listed in "Ptycho parameters.xlsx" that has a matching scan folder becomes
-an independent branch of one Pegasus DAG.
+Pegasus version of param_config_multislice.py: the same loop over scan folders
+and "Ptycho parameters.xlsx" rows writes Scripts/run_<scan>_Scan<n>.m from the
+MATLAB template, but instead of an sbatch line per scan it adds a Pegasus job:
 
-At generation time (as param_config did), each scan's MATLAB script is
-rendered from the template into scripts/run_<scan>.m and registered in the
-replica catalog. The workflow then has:
+    ptycho_recon (one per scan, all in parallel) - run the script with host
+    MATLAB + fold_slice on one GPU, return Recon_result/ as a tarball
 
-1. ptycho_recon (per scan, in parallel) - run fold_slice / PtychoShelves with
-   host MATLAB on one GPU
-2. summarize (once) - collect the per-scan summaries into recon_summary.csv
-
-The execution site is not described here: the planner downloads it from the
-centrally hosted Pegasus site catalogs (github.com/pegasushub/pegasus-site-catalogs,
-property pegasus.catalog.site.repo.file) and jobs are planned for the site
-named "compute". The local sites.yml written here only describes the submit
-host ("local") and is merged over the downloaded catalog.
+The execution site comes from the centrally hosted Pegasus site catalogs
+(github.com/pegasushub/pegasus-site-catalogs, property
+pegasus.catalog.site.repo.file); jobs are planned for the site "compute".
 
 Usage:
     ./workflow_generator.py --data-dir "/scratch/zhangych/Data/" \\
-        --site-catalog-file access-pegasus.yml \\
-        --fold-slice-dir /home/zhangych/fold_slice --mode multislice
+        --site-catalog-file access-pegasus.yml --fold-slice-dir ~/fold_slice
 """
 
 import argparse
-import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
 from Pegasus.api import *
-
-import ptycho_params  # pandas/openpyxl are only imported when sheets are read
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,31 +35,122 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Per-tool resource configuration. ptycho_recon mirrors the old sbatch file:
-# --cpus-per-task=4 --gpus-per-task=a100:1 --mem-per-gpu=40GB
-# "tag" selects the matching x-tags profiles (e.g. a GPU queue) from the
-# hosted site catalog for the compute site.
-TOOL_CONFIGS = {
-    "ptycho_recon": {"memory": "40 GB", "cores": 4, "gpus": 1, "container": False,
-                     "tag": "gpu"},
-    "summarize": {"memory": "1 GB", "cores": 1, "container": True, "tag": "cpu"},
+# ----------------------------------------------------------------------
+# Settings (edit here, as code_dir / sbatch settings in the old scripts)
+# ----------------------------------------------------------------------
+TEMPLATES = {
+    "multislice": "templates/Ptychography_reconstruction_multislice_template.m",
+    "singleslice": "templates/Ptychography_reconstruction_singleslice_template.m",
+}
+RBF_XLSX = "config/rbf.xlsx"
+MATLAB_MODULE = "matlab/2021b"  # '' if matlab is already on PATH
+
+# As the old sbatch file: --cpus-per-task=4 --gpus-per-task=1
+# --mem-per-gpu=40GB --time=4:00:00. The "gpu" tag picks the gpu x-tags
+# profiles (e.g. a GPU queue) from the hosted site catalog.
+RECON_RESOURCES = {"memory": "40 GB", "cores": 4, "gpus": 1, "runtime": 14400}
+RECON_TAG = "gpu"
+
+# Used in multislice mode when the sheet has no such columns
+MULTISLICE_DEFAULTS = {
+    "previous_object": 0, "regularization": 0.1, "thickness": 13, "Nlayers": 2,
 }
 
-# Site name the hosted catalogs use for the execution site
 COMPUTE_SITE = "compute"
 
-# Files in pegasushub/pegasus-site-catalogs (conf/) at the time of writing
-KNOWN_HOSTED_CATALOGS = [
-    "access-pegasus.yml", "access-pegasus-expanse.yml", "nersc-perlmutter.yml",
-    "ospool-ap40.yml", "ospool-ap41.yml", "purdue-anvil.yml", "unity.yml",
-    "usc-discovery.yml", "usc-laguna.yml",
+# Placeholders for paths only known on the worker; resolved by ptycho_recon.py
+JOB_DIR_TOKEN = "__PEGASUS_JOB_DIR__"
+FOLD_SLICE_TOKEN = "__FOLD_SLICE_DIR__"
+
+# Sheet columns. The current sheets have 28 columns; a 32-column sheet also
+# has the four multislice columns after initial_probe.
+PARAM_HEADER = [
+    "Date", "Sample", "ROI", "Tool", "Voltage", "Acqu_time",
+    "Additional_identifider", "Conv_angle", "Camera_len", "Mag", "Defocus",
+    "Screen_current", "Scan_rot", "Scan_size", "Scale",
+    "Image_shear", "Resample_factor", "dScanXY", "Diff_pattern_size",
+    "background_subtraction", "Niter", "Probe_states", "Probe_modes",
+    "GPU_solver", "errmetric", "initial_probe",
+]
+MULTISLICE_HEADER = ["previous_object", "regularization", "thickness", "Nlayers"]
+TRAILING_HEADER = ["Result", "Notes"]
+RBF_HEADER = ["voltage", "camera_len", "conv_angle", "rbf"]
+
+REPLACE_VARS = [
+    "rot_ang", "camera_len", "dScanX", "dScanY", "exp_dir",
+    "data_dir", "N_scan_x", "N_scan_y", "voltage", "ADU", "alpha0",
+    "rbf", "scan_step_size", "data_descriptor", "mag", "scan_number",
+    "resample_factor", "defocus", "background_subtraction", "Niter",
+    "Np_crop_pad", "Nprobe", "variable_probe_modes", "GPU_solver",
+    "errmetric", "initial_probe", "cSAXS_matlab_path", "ptycho_matlab_path",
 ]
 
-TEMPLATES = ptycho_params.TEMPLATES
+
+# ----------------------------------------------------------------------
+# Lookups (as in param_config_multislice.py)
+# ----------------------------------------------------------------------
+def get_rbf(rbf_df, voltage, camera_len, conv_angle):
+    rbfs = rbf_df.loc[(rbf_df["voltage"] == voltage) & (rbf_df["camera_len"] == camera_len)
+                      & (rbf_df["conv_angle"] == conv_angle)]
+    if rbfs.shape[0] == 0:
+        print(f"voltage({voltage}), camera_len({camera_len}), conv_angle({conv_angle}) combination not found")
+    elif rbfs.shape[0] > 1:
+        print(f"Multiple voltage({voltage}), camera_len({camera_len}), conv_angle({conv_angle}) combinations found")
+    else:
+        return rbfs.iloc[0]["rbf"]
+
+
+def get_ADU(voltage):
+    if voltage == 80:
+        return 151
+    elif voltage == 200:
+        return 393
+    elif voltage == 300:
+        return 591
+    else:
+        print(f"Voltage({voltage}) not found, ADU not defined!")
+
+
+def get_alpha0(conv_angle):
+    if conv_angle == 18:
+        return 18.44
+    elif conv_angle == 25.2:
+        return 24.92
+    elif conv_angle == 36:
+        return 36.4
+    elif conv_angle == 54:
+        return 55.45
+    else:
+        print(f"Conv_angle({conv_angle}) not found, alpha0 not defined!")
+
+
+def get_scan_step_size(mag, N_scan_x):
+    if mag == 5.1:
+        return 1.182 / N_scan_x * 128
+    elif mag == 7.2:
+        return 0.839 / N_scan_x * 128
+    elif mag == 10:
+        return 0.605 / N_scan_x * 128
+    elif mag == 14.5:
+        return 0.429 / N_scan_x * 128
+    elif mag == 20.5:
+        return 0.297 / N_scan_x * 128
+    elif mag == 29:
+        return 0.208 / N_scan_x * 128
+    elif mag == 41:
+        return 0.147 / N_scan_x * 128
+    else:
+        print(f"mag({mag}) not found, scan_step_size not defined!")
+
+
+def replace_single_var(var_name, var_value, string):
+    """Same regex as param_config: replace the value of `\\n<var> = ...`."""
+    return re.sub(r"(\n{}( )*=( )*['|\"|\[]?)[^\n|^;|^'|^\"|^\]]*".format(var_name),
+                  lambda m: m.group(1) + var_value, string)
 
 
 class PtychoWorkflow:
-    """One reconstruction branch per (scan folder, spreadsheet row)."""
+    """One ptycho_recon job per (scan folder, spreadsheet row)."""
 
     wf = None
     sc = None
@@ -84,15 +164,12 @@ class PtychoWorkflow:
     local_storage_dir = None
     wf_name = "ptycho"
 
-    def __init__(self, scans, scripts, args, dagfile="workflow.yml"):
+    def __init__(self, args, dagfile="workflow.yml"):
         self.dagfile = dagfile
         self.wf_dir = str(Path(__file__).parent.resolve())
         self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
-        self.local_storage_dir = args.output_dir or os.path.join(self.wf_dir, "output")
-        self.params_dir = os.path.join(self.wf_dir, "params")
-        self.scripts_dir = os.path.join(self.wf_dir, "scripts")
-        self.scans = scans
-        self.scripts = scripts  # job_id -> rendered MATLAB script text
+        self.local_storage_dir = os.path.join(self.wf_dir, "output")
+        self.script_dir = os.path.join(self.wf_dir, "Scripts")
         self.args = args
 
     def write(self):
@@ -110,28 +187,14 @@ class PtychoWorkflow:
     def create_pegasus_properties(self):
         self.props = Properties()
         self.props["pegasus.transfer.threads"] = "16"
-        # A GPU node occasionally dies mid-run; retry each job once
-        self.props["dagman.retry"] = str(self.args.retry)
-
-        # Hosted site catalog: the planner downloads this file from
-        # github.com/pegasushub/pegasus-site-catalogs (branch = Pegasus
-        # major.minor) and merges the local sites.yml over it.
+        self.props["dagman.retry"] = "1"
+        # Download the compute site from the hosted site catalogs
         self.props["pegasus.catalog.site.repo.file"] = self.args.site_catalog_file
-        if self.args.site_catalog_refresh is not None:
-            self.props["pegasus.catalog.site.repo.interval"] = str(
-                self.args.site_catalog_refresh
-            )
-
-        # Site-specific overrides of the downloaded compute entry, e.g.
-        # pegasus.queue=gpu or pegasus.project=myalloc
-        for ns, key, value in self.args.site_profile:
-            self.props.add_site_profile(self.args.execution_site_name, ns, key, value)
 
     # ------------------------------------------------------------------
-    # Site Catalog
+    # Site Catalog — only the submit host; "compute" is downloaded
     # ------------------------------------------------------------------
     def create_sites_catalog(self):
-        """Only the submit host. The compute site comes from the hosted catalog."""
         self.sc = SiteCatalog()
 
         local = Site("local").add_directories(
@@ -155,377 +218,257 @@ class PtychoWorkflow:
     def create_transformation_catalog(self, exec_site_name=COMPUTE_SITE):
         self.tc = TransformationCatalog()
 
-        # Container for summarize only. ptycho_recon runs on the host so it
-        # can use the site's licensed MATLAB (module load).
-        container = None
-        if not self.args.no_container:
-            container = Container(
-                "ptycho_container",
-                container_type=Container.SINGULARITY,
-                image="file://" + os.path.abspath(self.args.container_image),
-                image_site="local",
-            )
-            self.tc.add_containers(container)
+        # No container: MATLAB is licensed, so the job uses the site's MATLAB
+        ptycho_recon = Transformation(
+            "ptycho_recon",
+            site=exec_site_name,
+            pfn=os.path.join(self.wf_dir, "bin/ptycho_recon.py"),
+            is_stageable=True,
+        ).add_pegasus_profile(**RECON_RESOURCES)
 
-        transformations = []
-        for tool_name, config in TOOL_CONFIGS.items():
-            tx = Transformation(
-                tool_name,
-                site=exec_site_name,
-                pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
-                is_stageable=True,
-                container=container if config["container"] else None,
-            ).add_pegasus_profile(
-                memory=(self.args.recon_memory if tool_name == "ptycho_recon"
-                        else config["memory"]),
-                cores=config.get("cores", 1),
-            )
-            if config.get("gpus"):
-                tx.add_pegasus_profile(gpus=config["gpus"])
-            if tool_name == "ptycho_recon":
-                # Walltime for batch-scheduler sites (hosted SLURM catalogs
-                # default to 30 min); the old sbatch file asked for 4 h.
-                tx.add_pegasus_profile(runtime=self.args.recon_runtime)
-            transformations.append(tx)
+        if not self.args.fold_slice_shared:
+            # CondorIO: HTCondor copies fold_slice into each job directory
+            ptycho_recon.add_profiles(Namespace.CONDOR, key="transfer_input_files",
+                                      value=self.args.fold_slice_dir)
 
-            if tool_name == "ptycho_recon":
-                if self.args.fold_slice_dir:
-                    # CondorIO: HTCondor copies the whole fold_slice tree into
-                    # each job's directory as ./<basename>
-                    tx.add_profiles(
-                        Namespace.CONDOR,
-                        key="transfer_input_files",
-                        value=os.path.abspath(self.args.fold_slice_dir.rstrip("/")),
-                    )
-                if self.args.gpu_requirements:
-                    tx.add_profiles(
-                        Namespace.CONDOR,
-                        key="requirements",
-                        value=self.args.gpu_requirements,
-                    )
-
-        self.tc.add_transformations(*transformations)
+        self.tc.add_transformations(ptycho_recon)
 
     # ------------------------------------------------------------------
-    # Replica Catalog
+    # Replica Catalog — per-scan files are added in create_workflow()
     # ------------------------------------------------------------------
     def create_replica_catalog(self):
         self.rc = ReplicaCatalog()
 
-        if any(s["background_subtraction"] == 1 for s in self.scans):
-            self.rc.add_replica("local", "background_subtraction.mat",
-                                "file://" + os.path.abspath(self.args.bg_file))
-
-        os.makedirs(self.params_dir, exist_ok=True)
-        os.makedirs(self.scripts_dir, exist_ok=True)
-        for scan in self.scans:
-            sid = scan["job_id"]
-
-            # Per-scan parameters; ptycho_recon.py uses them to lay out inputs
-            params_path = os.path.join(self.params_dir, f"{sid}.json")
-            with open(params_path, "w") as f:
-                json.dump(scan, f, indent=2)
-            self.rc.add_replica("local", f"{sid}_params.json", "file://" + params_path)
-
-            # Rendered MATLAB script (the old Scripts/run_<scan>.m)
-            script_lfn = f"{scan['script_name']}.m"
-            script_path = os.path.join(self.scripts_dir, script_lfn)
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(self.scripts[sid])
-            self.rc.add_replica("local", script_lfn, "file://" + script_path)
-
-            # Raw files share a name across scans (scan_x128_y128.raw), so the
-            # LFN is made unique; ptycho_recon.py links it back to its real name.
-            self.rc.add_replica("local", f"{sid}_{scan['raw_name']}",
-                                "file://" + scan["raw_path"])
-
-            if scan["init_recon_path"]:
-                self.rc.add_replica("local", f"{sid}_init_recon.mat",
-                                    "file://" + scan["init_recon_path"])
+        self.bg_file = None
+        bg_path = self.args.bg_file
+        if os.path.isfile(bg_path):
+            self.bg_file = File("background_subtraction.mat")
+            self.rc.add_replica("local", self.bg_file, "file://" + bg_path)
 
     # ------------------------------------------------------------------
-    # Workflow DAG
+    # Workflow DAG — the loop of param_config_multislice.py
     # ------------------------------------------------------------------
     def create_workflow(self):
+        import pandas as pd
+
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
+        main_dir = self.args.data_dir
+        mode = self.args.mode
+        os.makedirs(self.script_dir, exist_ok=True)
 
-        bg_file = File("background_subtraction.mat")
+        # Step 1: read table header
+        param_df = pd.read_excel(self.args.params_xlsx)
+        multislice_cols = param_df.shape[1] == len(PARAM_HEADER + MULTISLICE_HEADER + TRAILING_HEADER)
+        param_df.columns = (PARAM_HEADER + (MULTISLICE_HEADER if multislice_cols else [])
+                            + TRAILING_HEADER)[:param_df.shape[1]]
+        rbf_df = pd.read_excel(os.path.join(self.wf_dir, RBF_XLSX), names=RBF_HEADER)
 
-        summaries = []
-        for scan in self.scans:
-            summaries.append(self._add_scan_pipeline(scan, bg_file))
+        with open(os.path.join(self.wf_dir, TEMPLATES[mode]), "r", encoding="utf-8") as file:
+            template_str = file.read()
 
-        summary_csv = File("recon_summary.csv")
-        summarize_job = (
-            Job("summarize", _id="summarize", node_label="summarize")
-            .add_pegasus_profile(tag=TOOL_CONFIGS["summarize"]["tag"])
-            .add_args(*[a for s in summaries for a in ("--input", s)],
-                      "--output", summary_csv)
-            .add_inputs(*summaries)
-            .add_outputs(summary_csv, stage_out=True, register_replica=False)
-        )
-        self.wf.add_jobs(summarize_job)
+        # Only folders whose name starts with a number (the Acqu. Time) are scans
+        scan_folders = [f for f in next(os.walk(main_dir))[1] if f.split("_")[0].isdigit()]
 
-    def _add_scan_pipeline(self, scan, bg_file):
-        """ptycho_recon for one scan; returns its summary File."""
-        sid = scan["job_id"]
+        for scan_folder in sorted(scan_folders):
+            acqu_time = int(scan_folder.split("_")[0])
+            scans = param_df.loc[param_df["Acqu_time"] == acqu_time].reset_index()
 
-        params = File(f"{sid}_params.json")
-        raw = File(f"{sid}_{scan['raw_name']}")
-        script = File(f"{scan['script_name']}.m")
-        recon_tar = File(f"{sid}/{sid}_recon.tar.gz")
-        matlab_log = File(f"{sid}/{sid}_matlab.log")
-        summary = File(f"{sid}_summary.json")
+            if scans.shape[0] == 0:
+                print(f"No scans found in the Ptycho parameters.xlsx for scan: {scan_folder}")
+                continue
 
-        recon_args = [
-            "--script", script,
-            "--params", params,
-            "--raw", raw,
-            "--fold-slice", self.fold_slice_arg(),
-            "--matlab-cmd", self.args.matlab_cmd,
-            "--output-tar", recon_tar,
-            "--log", matlab_log,
-            "--summary", summary,
-        ]
-        if self.args.matlab_module:
-            recon_args += ["--matlab-module", self.args.matlab_module]
-        recon_inputs = [script, params, raw]
+            for index, row in scans.iterrows():
+                scan_number = index + 1
+                scan_folder_formatted = re.sub(r"\+", "_plus", scan_folder)
+                scan_folder_formatted = re.sub("-", "_minus", scan_folder_formatted)
+                scan_folder_formatted = re.sub(r"\.", "pt", scan_folder_formatted)
+                job_id = f"{scan_folder_formatted}_Scan{scan_number}"
 
-        if scan["background_subtraction"] == 1:
-            recon_args += ["--bg-file", bg_file]
-            recon_inputs.append(bg_file)
-        if scan["init_recon_path"]:
-            init_recon = File(f"{sid}_init_recon.mat")
-            recon_args += ["--init-recon", init_recon]
-            recon_inputs.append(init_recon)
+                if pd.isna(row["Scan_size"]):
+                    print(f"{job_id}: Scan size is empty, skipped")
+                    continue
 
-        recon_job = (
-            Job("ptycho_recon", _id=f"recon_{sid}", node_label=f"recon_{sid}")
-            .add_pegasus_profile(tag=TOOL_CONFIGS["ptycho_recon"]["tag"])
-            .add_args(*recon_args)
-            .add_inputs(*recon_inputs)
+                # Step 2: read table content
+                values = {
+                    "rot_ang": row["Scan_rot"],
+                    "camera_len": row["Camera_len"],
+                    "dScanX": row["dScanXY"],
+                    "dScanY": row["dScanXY"],
+                    "exp_dir": f"{JOB_DIR_TOKEN}/",
+                    "data_dir": scan_folder,
+                    "N_scan_x": int(row["Scan_size"]),
+                    "N_scan_y": int(row["Scan_size"]),
+                    "voltage": row["Voltage"],
+                    "ADU": get_ADU(row["Voltage"]),
+                    "alpha0": get_alpha0(row["Conv_angle"]),
+                    "rbf": get_rbf(rbf_df, row["Voltage"], row["Camera_len"], row["Conv_angle"]),
+                    "scan_step_size": get_scan_step_size(row["Mag"], int(row["Scan_size"])),
+                    # (an empty Sample/ROI cell is NaN; use "" like an empty string)
+                    "data_descriptor": re.sub(r"[\W]+", "_", "" if pd.isna(row["Sample"]) else str(row["Sample"]))
+                    + "_" + re.sub(r"[\W]+", "_", "" if pd.isna(row["ROI"]) else str(row["ROI"])),
+                    "mag": row["Mag"],
+                    "scan_number": scan_number,
+                    "resample_factor": row["Resample_factor"],
+                    "defocus": row["Defocus"],
+                    "background_subtraction": int(row["background_subtraction"]),
+                    "Niter": row["Niter"],
+                    "Np_crop_pad": f"{row['Diff_pattern_size']},{row['Diff_pattern_size']}",
+                    "Nprobe": row["Probe_states"],
+                    "variable_probe_modes": row["Probe_modes"],
+                    "GPU_solver": row["GPU_solver"],
+                    "errmetric": row["errmetric"],
+                    "initial_probe": int(row["initial_probe"]),
+                    "cSAXS_matlab_path": FOLD_SLICE_TOKEN,
+                    "ptycho_matlab_path": f"{FOLD_SLICE_TOKEN}/ptycho",
+                }
+                replace_vars = list(REPLACE_VARS)
+                if mode == "multislice":
+                    for col in MULTISLICE_HEADER:
+                        values[col] = row[col] if multislice_cols else MULTISLICE_DEFAULTS[col]
+                    replace_vars += MULTISLICE_HEADER
+
+                if any(values[v] is None for v in ("ADU", "alpha0", "rbf", "scan_step_size")):
+                    print(f"{job_id}: skipped (see message above)")
+                    continue
+
+                raw_name = f"scan_x{values['N_scan_x']}_y{values['N_scan_y']}.raw"
+                raw_path = os.path.join(main_dir, scan_folder, raw_name)
+                if not os.path.isfile(raw_path):
+                    print(f"{job_id}: {raw_path} not found, skipped")
+                    continue
+                if values["background_subtraction"] == 1 and self.bg_file is None:
+                    print(f"{job_id}: background_subtraction=1 but "
+                          f"{self.args.bg_file} not found (use --bg-file), skipped")
+                    continue
+
+                # Step 3: replace variables
+                file_str = template_str
+                for var_name in replace_vars:
+                    file_str = replace_single_var(var_name, str(values[var_name]), file_str)
+
+                script_path = os.path.join(self.script_dir, f"run_{job_id}.m")
+                with open(script_path, "w", encoding="utf-8") as file:
+                    file.write(file_str)
+
+                # Step 4: add the reconstruction job (was: a line in the sbatch file)
+                self._add_recon_job(job_id, scan_folder, script_path, raw_path,
+                                    raw_name, values)
+
+        print(f"{len(self.wf.jobs)} jobs added, scripts in {self.script_dir}/")
+
+    def _add_recon_job(self, job_id, scan_folder, script_path, raw_path, raw_name, values):
+        script = File(os.path.basename(script_path))
+        # Raw files share a name across scans, so the LFN is made unique
+        raw = File(f"{job_id}_{raw_name}")
+        recon_tar = File(f"{job_id}/{job_id}_recon.tar.gz")
+        matlab_log = File(f"{job_id}/{job_id}_matlab.log")
+
+        self.rc.add_replica("local", script, "file://" + script_path)
+        self.rc.add_replica("local", raw, "file://" + raw_path)
+
+        job = (
+            Job("ptycho_recon", _id=f"recon_{job_id}", node_label=f"recon_{job_id}")
+            .add_pegasus_profile(tag=RECON_TAG)
+            .add_args("--script", script, "--scan-folder", scan_folder,
+                      "--raw", raw, "--raw-name", raw_name,
+                      "--fold-slice", self.args.fold_slice_arg,
+                      "--matlab-module", MATLAB_MODULE,
+                      "--output-tar", recon_tar, "--log", matlab_log)
+            .add_inputs(script, raw)
             .add_outputs(recon_tar, matlab_log, stage_out=True, register_replica=False)
-            .add_outputs(summary, stage_out=False, register_replica=False)
         )
-        self.wf.add_jobs(recon_job)
-        return summary
 
-    def fold_slice_arg(self):
-        """What ptycho_recon.py is told: CondorIO basename or worker path."""
-        if self.args.fold_slice_dir:
-            return os.path.basename(self.args.fold_slice_dir.rstrip("/"))
-        return self.args.fold_slice_worker_path
+        if values["background_subtraction"] == 1:
+            job.add_args("--bg-file", self.bg_file).add_inputs(self.bg_file)
+
+        if values["initial_probe"] == 1:
+            # The template loads the single .mat in Recon_files/<scan folder>/
+            recon_dir = os.path.join(self.args.data_dir, "Recon_files", scan_folder)
+            mats = [f for f in os.listdir(recon_dir) if f.endswith(".mat")]
+            init_recon = File(f"{job_id}_init_recon.mat")
+            self.rc.add_replica("local", init_recon,
+                                "file://" + os.path.join(recon_dir, mats[0]))
+            job.add_args("--init-recon", init_recon).add_inputs(init_recon)
+
+        self.wf.add_jobs(job)
 
 
 # ======================================================================
 # main() — CLI argument parsing
 # ======================================================================
 def main():
-    wf_dir = str(Path(__file__).parent.resolve())
-
     parser = argparse.ArgumentParser(
         description="Generate a Pegasus workflow that reconstructs every scan "
                     "of a ptychography experiment (fold_slice / PtychoShelves).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # HTCondor pool (ACCESS Pegasus); fold_slice shipped with each job
   %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file access-pegasus.yml \\
       --fold-slice-dir ~/fold_slice
-
-  # SLURM cluster; fold_slice already on the shared filesystem, GPU queue override
   %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file usc-discovery.yml \\
-      --fold-slice-worker-path /home/zhangych/fold_slice --mode singleslice \\
-      --site-profile pegasus.project=myalloc --scans 1302 1305
+      --fold-slice-dir /home/zhangych/fold_slice --fold-slice-shared --mode singleslice
 
-  Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
+Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
 """,
     )
 
     # --- Standard Pegasus arguments ---
     parser.add_argument("-s", "--skip-sites-catalog", action="store_true",
-                        help="Do not write the local sites.yml (Pegasus then uses "
-                             "its default 'local' site)")
+                        help="Skip site catalog creation")
     parser.add_argument("-e", "--execution-site-name", metavar="STR", type=str,
                         default=COMPUTE_SITE,
-                        help=f"Execution site name in the hosted catalog "
-                             f"(default: {COMPUTE_SITE})")
-
-    # --- Hosted site catalog ---
-    g = parser.add_argument_group("hosted site catalog")
-    g.add_argument("--site-catalog-file", required=True, metavar="FILE",
-                   help="Hosted site catalog to download from "
-                        "github.com/pegasushub/pegasus-site-catalogs (conf/), e.g. "
-                        + ", ".join(KNOWN_HOSTED_CATALOGS))
-    g.add_argument("--site-catalog-refresh", type=int, default=None, metavar="SECONDS",
-                   help="Re-download the hosted catalog if older than this "
-                        "(Pegasus default: 1 day)")
-    g.add_argument("--site-profile", action="append", default=[],
-                   metavar="NS.KEY=VALUE",
-                   help="Override a profile of the downloaded compute site, e.g. "
-                        "pegasus.queue=gpu or pegasus.project=myalloc (repeatable)")
+                        help=f"Execution site name (default: {COMPUTE_SITE})")
     parser.add_argument("-o", "--output", metavar="STR", type=str,
                         default="workflow.yml",
                         help="Output file (default: workflow.yml)")
-    parser.add_argument("--output-dir", default=None,
-                        help="Where final outputs are staged (default: ./output)")
 
-    # --- Experiment inputs ---
-    g = parser.add_argument_group("experiment inputs")
-    g.add_argument("--data-dir", required=True,
-                   help="Experiment folder: scan folders named <AcquTime>_..., "
-                        '"Ptycho parameters.xlsx", "Background subtraction.mat"')
-    g.add_argument("--params-xlsx", default=None,
-                   help='Parameters sheet (default: <data-dir>/"Ptycho parameters.xlsx")')
-    g.add_argument("--rbf-xlsx", default=os.path.join(wf_dir, "config", "rbf.xlsx"),
-                   help="rbf calibration table (default: config/rbf.xlsx)")
-    g.add_argument("--bg-file", default=None,
-                   help='Background file (default: <data-dir>/"Background subtraction.mat")')
-    g.add_argument("--scans", type=int, nargs="+", default=None, metavar="ACQU_TIME",
-                   help="Only reconstruct these acquisition times (default: all)")
-    g.add_argument("--skip-missing", action="store_true",
-                   help="Skip scans with problems (missing raw file, unknown rbf, ...) "
-                        "instead of failing")
-
-    # --- Reconstruction ---
-    g = parser.add_argument_group("reconstruction")
-    g.add_argument("--mode", choices=sorted(TEMPLATES), default="multislice",
-                   help="Which MATLAB template to use (default: multislice)")
-    g.add_argument("--template", default=None,
-                   help="Override the MATLAB template file for --mode")
-    g.add_argument("--regularization", type=float, default=0.1,
-                   help="multislice default when the sheet has no such column (0.1)")
-    g.add_argument("--thickness", type=float, default=13,
-                   help="multislice default sample thickness in angstrom (13)")
-    g.add_argument("--nlayers", type=int, default=2,
-                   help="multislice default number of slices (2)")
-    g.add_argument("--previous-object", type=int, default=0, choices=[0, 1],
-                   help="multislice default for previous_object (0)")
-
-    # --- Execution environment ---
-    g = parser.add_argument_group("execution environment")
-    fs = g.add_mutually_exclusive_group(required=True)
-    fs.add_argument("--fold-slice-dir",
-                    help="fold_slice checkout on the submit host; sent to every "
-                         "recon job via HTCondor file transfer")
-    fs.add_argument("--fold-slice-worker-path",
-                    help="fold_slice path that already exists on every GPU worker "
-                         "(shared filesystem); nothing is transferred")
-    g.add_argument("--matlab-module", default="matlab/2021b",
-                   help="Module loaded before MATLAB; '' to skip (default: matlab/2021b)")
-    g.add_argument("--matlab-cmd", default="matlab",
-                   help="MATLAB executable on the workers (default: matlab)")
-    g.add_argument("--recon-memory", default="40 GB",
-                   help="Memory for each recon job (default: 40 GB)")
-    g.add_argument("--recon-runtime", type=int, default=14400, metavar="SECONDS",
-                   help="Walltime for each recon job on batch sites (default: 14400 = 4 h)")
-    g.add_argument("--gpu-requirements", default=None,
-                   help='Extra HTCondor requirements for recon jobs, '
-                        'e.g. \'(GPUs_GlobalMemoryMb >= 40000)\'')
-    g.add_argument("--container-image", default=os.path.join(wf_dir, "Ptycho_Container.sif"),
-                   help="Apptainer image for summarize (default: ./Ptycho_Container.sif)")
-    g.add_argument("--no-container", action="store_true",
-                   help="Run summarize with the workers' own python3")
-    g.add_argument("--retry", type=int, default=1,
-                   help="DAGMan retries per job (default: 1)")
+    # --- Workflow-specific arguments ---
+    parser.add_argument("--data-dir", required=True,
+                        help='Experiment folder: scan folders, "Ptycho parameters.xlsx", '
+                             '"Background subtraction.mat"')
+    parser.add_argument("--site-catalog-file", required=True,
+                        help="Hosted site catalog (pegasushub/pegasus-site-catalogs conf/), "
+                             "e.g. access-pegasus.yml, usc-discovery.yml")
+    parser.add_argument("--fold-slice-dir", required=True,
+                        help="fold_slice directory (sent to each job unless --fold-slice-shared)")
+    parser.add_argument("--fold-slice-shared", action="store_true",
+                        help="--fold-slice-dir already exists on every worker; don't transfer it")
+    parser.add_argument("--bg-file", default=None,
+                        help='Background file (default: <data-dir>/"Background subtraction.mat")')
+    parser.add_argument("--mode", choices=sorted(TEMPLATES), default="multislice",
+                        help="MATLAB template to use (default: multislice)")
 
     args = parser.parse_args()
 
-    # --- Input validation (before any Pegasus API calls) ---
-    if os.path.basename(args.site_catalog_file) != args.site_catalog_file:
-        parser.error("--site-catalog-file is a file name in the hosted repository "
-                     f"(e.g. access-pegasus.yml), not a path: {args.site_catalog_file}")
-    if args.site_catalog_file not in KNOWN_HOSTED_CATALOGS:
-        logger.warning(f"{args.site_catalog_file} is not one of the hosted catalogs "
-                       f"known to this generator: {', '.join(KNOWN_HOSTED_CATALOGS)}")
-    site_profiles = []
-    for spec in args.site_profile:
-        nskey, sep, value = spec.partition("=")
-        ns, dot, key = nskey.partition(".")
-        if not sep or not dot or not ns or not key:
-            parser.error(f"--site-profile must look like NS.KEY=VALUE: {spec}")
-        site_profiles.append((ns, key, value))
-    args.site_profile = site_profiles
-
+    # --- Input validation ---
     args.data_dir = os.path.abspath(args.data_dir)
-    if not os.path.isdir(args.data_dir):
-        parser.error(f"--data-dir not found: {args.data_dir}")
-    args.params_xlsx = args.params_xlsx or os.path.join(args.data_dir, "Ptycho parameters.xlsx")
-    args.bg_file = args.bg_file or os.path.join(args.data_dir, "Background subtraction.mat")
-    for label, path in (("--params-xlsx", args.params_xlsx), ("--rbf-xlsx", args.rbf_xlsx)):
-        if not os.path.isfile(path):
-            parser.error(f"{label} not found: {path}")
-    template = args.template or os.path.join(wf_dir, TEMPLATES[args.mode])
-    if not os.path.isfile(template):
-        parser.error(f"MATLAB template not found: {template}")
-    if args.fold_slice_dir and not os.path.isdir(os.path.join(args.fold_slice_dir, "ptycho")):
-        parser.error(f"--fold-slice-dir has no ptycho/ subfolder: {args.fold_slice_dir}")
-    if not args.no_container and not os.path.isfile(args.container_image):
-        logger.warning(f"Container image not built yet: {args.container_image} "
-                       "(see README: apptainer build)")
-
-    defaults = {
-        "regularization": args.regularization,
-        "thickness": args.thickness,
-        "Nlayers": args.nlayers,
-        "previous_object": args.previous_object,
-    }
-    try:
-        scans, problems = ptycho_params.collect_scans(
-            args.data_dir, args.params_xlsx, args.rbf_xlsx, args.mode, defaults,
-            acqu_times=set(args.scans) if args.scans else None,
-        )
-    except ImportError as e:
-        sys.exit(f"Error: {e}. The generator needs pandas and openpyxl "
-                 "(pip install pandas openpyxl).")
-
-    for scan in scans:
-        if scan["raw_path"] is None:
-            problems.append(f"{scan['job_id']}: raw file {scan['raw_name']} not in "
-                            f"{scan['scan_folder']}/")
-        if scan["background_subtraction"] == 1 and not os.path.isfile(args.bg_file):
-            problems.append(f"{scan['job_id']}: background_subtraction=1 but "
-                            f"{args.bg_file} does not exist (use --bg-file)")
-    bad = {p.split(":")[0] for p in problems}
-    scans = [s for s in scans if s["job_id"] not in bad]
-
-    for p in problems:
-        logger.warning(p)
-    if problems and not args.skip_missing:
-        sys.exit(f"Error: {len(problems)} problem(s) above. Fix them or pass "
-                 "--skip-missing to reconstruct only the valid scans.")
-    if not scans:
-        sys.exit("Error: no scans to reconstruct.")
-
-    # Render every scan's MATLAB script now, so template problems surface
-    # before anything is planned or queued.
-    with open(template, encoding="utf-8") as f:
-        template_text = f.read()
-    scripts = {}
-    for scan in scans:
-        try:
-            scripts[scan["job_id"]], missing = ptycho_params.render_script(
-                template_text, scan["replace_vars"])
-        except ValueError as e:
-            sys.exit(f"Error: {template}: {e}")
-    if missing:
-        logger.warning(f"Variables not in template (ignored): {', '.join(missing)}")
+    args.params_xlsx = os.path.join(args.data_dir, "Ptycho parameters.xlsx")
+    args.bg_file = os.path.abspath(
+        args.bg_file or os.path.join(args.data_dir, "Background subtraction.mat"))
+    if not os.path.isfile(args.bg_file):
+        logger.warning(f"No background file at {args.bg_file}; scans with "
+                       "background_subtraction=1 will be skipped (use --bg-file)")
+    if not os.path.isfile(args.params_xlsx):
+        parser.error(f"not found: {args.params_xlsx}")
+    if not args.fold_slice_shared:
+        args.fold_slice_dir = os.path.abspath(args.fold_slice_dir.rstrip("/"))
+        if not os.path.isdir(os.path.join(args.fold_slice_dir, "ptycho")):
+            parser.error(f"--fold-slice-dir has no ptycho/ subfolder: {args.fold_slice_dir}")
+    # What the job is told: the transferred copy's name, or the worker path
+    args.fold_slice_arg = (args.fold_slice_dir if args.fold_slice_shared
+                           else os.path.basename(args.fold_slice_dir))
 
     logger.info("=" * 70)
     logger.info("PTYCHO WORKFLOW GENERATOR")
     logger.info("=" * 70)
-    logger.info(f"Experiment: {args.data_dir}")
-    logger.info(f"Mode:       {args.mode} ({template})")
-    for s in scans:
-        logger.info(f"  {s['job_id']}")
-    logger.info(f"Scans:      {len(scans)}")
+    logger.info(f"Working in {args.data_dir} ({args.mode})")
     logger.info(f"Execution site: {args.execution_site_name} "
                 f"(hosted catalog {args.site_catalog_file})")
     logger.info(f"Output file: {args.output}")
     logger.info("=" * 70)
 
     try:
-        workflow = PtychoWorkflow(scans, scripts, args, dagfile=args.output)
+        workflow = PtychoWorkflow(args, dagfile=args.output)
 
         workflow.create_pegasus_properties()
 
@@ -535,13 +478,14 @@ Examples:
         workflow.create_transformation_catalog(exec_site_name=args.execution_site_name)
         workflow.create_replica_catalog()
         workflow.create_workflow()
+        if not workflow.wf.jobs:
+            sys.exit("Error: no scans to reconstruct.")
         workflow.write()
 
-        logger.info(f"Workflow written to {args.output}; "
-                    f"MATLAB scripts in {workflow.scripts_dir}/")
+        logger.info(f"Workflow written to {args.output}")
         logger.info(
             f"Submit: pegasus-plan --submit "
-            f"-s {args.execution_site_name} -o local {args.output}"
+            f"--sites {args.execution_site_name} --output-sites local {args.output}"
         )
 
     except Exception as e:
