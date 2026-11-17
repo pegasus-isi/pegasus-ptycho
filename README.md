@@ -11,30 +11,37 @@ brings the results back.
 ## Pipeline Overview
 
 ```
-Ptycho parameters.xlsx ─┐      (read by workflow_generator.py)
-rbf.xlsx ───────────────┤
+Ptycho parameters.xlsx ─┐   workflow_generator.py
+rbf.xlsx ───────────────┼──> (generation time) ──> scripts/run_<scan A>.m ...
+MATLAB template ────────┤
 scan folders ───────────┘
-        │
-        ├── render_script(scan A) ──> ptycho_recon(scan A, GPU) ──┐
-        ├── render_script(scan B) ──> ptycho_recon(scan B, GPU) ──┼──> summarize ──> recon_summary.csv
-        └── render_script(scan N) ──> ptycho_recon(scan N, GPU) ──┘
+                                        │
+        ┌───────────────────────────────┘   (workflow)
+        ├── ptycho_recon(scan A, GPU) ──┐
+        ├── ptycho_recon(scan B, GPU) ──┼──> summarize ──> recon_summary.csv
+        └── ptycho_recon(scan N, GPU) ──┘
 ```
 
 | Step | Tool | Description |
 |------|------|-------------|
-| 0. (generation time) | `ptycho_params.py` (pandas) | Reads the parameters and rbf sheets and works out ADU, alpha0, rbf and scan step size for each scan. This is the spreadsheet half of `param_config_multislice.py`. |
-| 1. render_script | Python | Fills in the MATLAB template for one scan, using the same regex replacement as `param_config`. |
-| 2. ptycho_recon | host MATLAB + fold_slice, 1 GPU | Lays out the staged inputs as the template expects, runs `matlab -batch run_<scan>`, and packs `Recon_result/` into a tarball. |
-| 3. summarize | Python | Combines the per-scan summaries into one CSV. |
+| 0. (generation time) | `ptycho_params.py` (pandas) | Reads the parameters and rbf sheets, works out ADU, alpha0, rbf and scan step size for each scan, and renders `scripts/run_<scan>.m` from the MATLAB template with the same regex replacement as `param_config_multislice.py`. |
+| 1. ptycho_recon | host MATLAB + fold_slice, 1 GPU | Lays out the staged inputs as the template expects, runs `matlab -batch run_<scan>`, and packs `Recon_result/` into a tarball. |
+| 2. summarize | Python | Combines the per-scan summaries into one CSV. |
+
+Rendering happens while generating, as `param_config` did, rather than as a
+job. It needs only the template and the spreadsheet, takes milliseconds, and
+as a job it would add one scheduled (on SLURM: queued) job per scan. Template
+problems also show up before anything is submitted. You can look at or diff
+`scripts/run_*.m` before planning, the same way you checked the old
+`Scripts/` folder.
 
 ## Directory Structure
 
 ```
 pegasus-ptycho/
 ├── workflow_generator.py        # Pegasus workflow generator
-├── ptycho_params.py             # Spreadsheet -> per-scan parameters (also a CLI)
+├── ptycho_params.py             # Spreadsheet -> per-scan parameters + MATLAB scripts (also a CLI)
 ├── bin/
-│   ├── render_script.py         # Template -> run_<scan>.m
 │   ├── ptycho_recon.py          # MATLAB/GPU reconstruction wrapper
 │   └── summarize.py             # Fan-in: recon_summary.csv
 ├── templates/
@@ -43,7 +50,7 @@ pegasus-ptycho/
 ├── config/
 │   └── rbf.xlsx                 # rbf calibration (voltage, camera length, conv. angle)
 ├── Apptainer/
-│   └── Ptycho_Container.def     # Container for the Python steps
+│   └── Ptycho_Container.def     # Container for the summarize step
 ├── run_manual.sh                # Step-by-step local test
 └── README.md
 ```
@@ -57,14 +64,14 @@ pegasus-ptycho/
   - MATLAB with the Parallel Computing Toolbox, either through `module load matlab/2021b` or on `PATH`
   - `python3` (the recon wrapper runs on the host, not in a container)
 - A fold_slice checkout
-- [Apptainer](https://apptainer.org/), to build the small container for the Python steps (optional, see `--no-container`)
+- [Apptainer](https://apptainer.org/), to build the small container for the summarize step (optional, see `--no-container`)
 
 ### Why MATLAB runs on the host
 
 MATLAB needs a license, so it cannot be baked into a container the way pip
 tools can. `ptycho_recon` runs directly on the GPU worker and loads MATLAB
-exactly as the old sbatch file did. Only `render_script` and `summarize` use
-the container, and they need nothing beyond the Python standard library.
+exactly as the old sbatch file did. Only `summarize` uses the container, and
+it needs nothing beyond the Python standard library.
 
 ## Setup
 
@@ -76,8 +83,8 @@ apptainer build Ptycho_Container.sif Apptainer/Ptycho_Container.def
 ```
 
 The generator looks for `./Ptycho_Container.sif` by default. Use
-`--container-image` to point it elsewhere, or `--no-container` to run the
-Python steps with the workers' own `python3`.
+`--container-image` to point it elsewhere, or `--no-container` to run
+`summarize` with the workers' own `python3` (then there is nothing to build).
 
 ### 2. Prepare the experiment folder
 
@@ -130,10 +137,10 @@ The generator does not describe the execution site itself. It uses Pegasus'
 | `usc-discovery.yml`, `usc-laguna.yml`, `unity.yml`, `purdue-anvil.yml` | SLURM clusters (direct submission) |
 | `nersc-perlmutter.yml` | NERSC Perlmutter (SFAPI) |
 
-**Job tags.** `ptycho_recon` jobs are tagged `gpu`, and `render_script` /
-`summarize` jobs are tagged `cpu`. When the hosted entry has `x-tags`, the
+**Job tags.** `ptycho_recon` jobs are tagged `gpu`, and the `summarize` job
+is tagged `cpu`. When the hosted entry has `x-tags`, the
 planner adds that tag's profiles. With `usc-discovery.yml`, for example,
-recon jobs go to the `gpu` queue and the Python steps stay on `main`.
+recon jobs go to the `gpu` queue and `summarize` stays on `main`.
 Resources set in the transformation catalog take precedence over the site
 catalog. Recon jobs always ask for 4 cores, 1 GPU, `--recon-memory` (40 GB)
 and `--recon-runtime` (4 h). The runtime matters on SLURM catalogs, which
@@ -182,7 +189,7 @@ To try it on the bundled sample dataset (which has no
 
 ```bash
 ./workflow_generator.py \
-    --data-dir "../Sample dataset" \
+    --data-dir "../Ptycho cluster script/Sample dataset" \
     --site-catalog-file access-pegasus.yml \
     --fold-slice-dir /home/zhangych/fold_slice \
     --bg-file "/path/to/Background subtraction.mat" \
@@ -218,8 +225,8 @@ problems. `--skip-missing` drops those scans and continues.
 | `--recon-memory` | `40 GB` | Memory per recon job |
 | `--recon-runtime` | `14400` | Walltime per recon job in seconds (batch sites) |
 | `--gpu-requirements` | none | Extra HTCondor `requirements`, e.g. `'(GPUs_GlobalMemoryMb >= 40000)'` |
-| `--container-image` | `./Ptycho_Container.sif` | Container for the Python steps |
-| `--no-container` | off | Run the Python steps without a container |
+| `--container-image` | `./Ptycho_Container.sif` | Container for `summarize` |
+| `--no-container` | off | Run `summarize` without a container |
 | `--retry` | `1` | DAGMan retries per job |
 | `--output-dir` | `./output` | Where final outputs are staged |
 | `-e`, `--execution-site-name` | `compute` | Execution site name in the hosted catalog |
@@ -245,11 +252,12 @@ MATLAB log.
 
 ## Outputs
 
-Final outputs are staged to `output/`:
+The rendered scripts stay in `scripts/` next to the generator, and a copy with
+worker paths filled in is inside each tarball. Final outputs are staged to
+`output/`:
 
 | Output | Description |
 |--------|-------------|
-| `run_<scan>_Scan<n>.m` | The rendered MATLAB script, kept as a record of the exact parameters. |
 | `<scan>_Scan<n>/<scan>_Scan<n>_recon.tar.gz` | The whole `Recon_result/` tree: `init_probe_*.mat`, `*_params.mat`, the `Reduced_run_*` / `Full_run_*` iterations, and the script with paths resolved. |
 | `<scan>_Scan<n>/<scan>_Scan<n>_matlab.log` | MATLAB stdout/stderr (the old `Log/Data_<scan>.txt`). |
 | `recon_summary.csv` | One row per scan: runtime, host, solver, Niter, layers, and `Full_run` files. |
@@ -260,8 +268,8 @@ data stays on the worker. It is not staged back.
 ## How the template is adapted to Pegasus
 
 Pegasus runs each job in its own scratch directory, so the hard-coded
-`/home/...` paths in the templates cannot be used. `render_script` writes two
-placeholders, and `ptycho_recon.py` resolves them on the worker:
+`/home/...` paths in the templates cannot be used. The generator renders two
+placeholders into each script, and `ptycho_recon.py` resolves them on the worker:
 
 | Template variable | Rendered as | Resolved on the worker to |
 |-------------------|-------------|---------------------------|
@@ -277,10 +285,10 @@ Nothing else in the templates was changed. As in `param_config`, the
 ## Testing locally
 
 ```bash
-./run_manual.sh --data-dir "../Sample dataset" --scan 1302
+./run_manual.sh --data-dir "../Ptycho cluster script/Sample dataset" --scan 1302
 ```
 
-This runs the spreadsheet parsing, `render_script` and `summarize` anywhere.
+This runs the spreadsheet parsing, script rendering and `summarize` anywhere.
 To also run the MATLAB reconstruction, run it on a GPU node with MATLAB and add
 `--fold-slice /path/to/fold_slice --matlab-module matlab/2021b`.
 
@@ -288,7 +296,6 @@ To also run the MATLAB reconstruction, run it on a GPU node with MATLAB and add
 
 | Step | Memory | Cores | GPUs |
 |------|--------|-------|------|
-| render_script | 1 GB | 1 | 0 |
 | ptycho_recon | 40 GB (`--recon-memory`) | 4 | 1 |
 | summarize | 1 GB | 1 | 0 |
 

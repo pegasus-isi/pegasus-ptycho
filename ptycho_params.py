@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
 """
-Turn "Ptycho parameters.xlsx" + "rbf.xlsx" into one parameter set per scan.
+Turn "Ptycho parameters.xlsx" + "rbf.xlsx" into one parameter set and one
+MATLAB script per scan.
 
-This is the spreadsheet logic of param_config_multislice.py, separated from
-the MATLAB script generation so that:
+This is param_config_multislice.py as a module: workflow_generator.py imports
+it to decide which scans become jobs and to render their run_<scan>.m scripts
+at generation time, and it can be run on its own (see run_manual.sh) to write
+the per-scan JSON files and scripts without generating a workflow.
 
-  * workflow_generator.py can import it to decide which scans become jobs, and
-  * it can be run on its own (see run_manual.sh) to dump the per-scan JSON
-    files that bin/render_script.py consumes.
+Paths only known on the GPU worker (job directory, fold_slice) are rendered
+as placeholders and resolved by bin/ptycho_recon.py.
 
 Each scan yields a dict:
 
@@ -28,7 +30,7 @@ Each scan yields a dict:
 
 Usage (stand-alone):
     ./ptycho_params.py --data-dir "/path/to/experiment/" --mode multislice \
-        --out-dir params/
+        --out-dir params/ --scripts-dir scripts/
 """
 
 import argparse
@@ -82,6 +84,18 @@ REPLACE_VARS = {
     "multislice": COMMON_VARS + MULTISLICE_COLS,
 }
 
+# Variables the workflow relies on to relocate data and code into the job
+# directory; a template without them cannot run under Pegasus.
+REQUIRED_VARS = {
+    "exp_dir", "data_dir", "scan_number", "N_scan_x", "N_scan_y",
+    "cSAXS_matlab_path", "ptycho_matlab_path",
+}
+
+TEMPLATES = {
+    "multislice": "templates/Ptychography_reconstruction_multislice_template.m",
+    "singleslice": "templates/Ptychography_reconstruction_singleslice_template.m",
+}
+
 ADU_BY_VOLTAGE = {80: 151, 200: 393, 300: 591}
 ALPHA0_BY_CONV_ANGLE = {18: 18.44, 25.2: 24.92, 36: 36.4, 54: 55.45}
 # Field of view (angstrom) of a 128-step scan at each UI magnification (Mx)
@@ -119,6 +133,31 @@ def format_scan_folder(scan_folder):
     name = re.sub(r"\.", "pt", name)
     # Anything else that is not a MATLAB/Pegasus-safe identifier character
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
+def replace_single_var(var_name, var_value, string):
+    """Same regex as param_config: replace the value of `\\n<var> = ...`."""
+    pattern = r"(\n{}( )*=( )*['|\"|\[]?)[^\n|^;|^'|^\"|^\]]*".format(re.escape(var_name))
+    # Function replacement so backslashes/group refs in values are literal
+    return re.subn(pattern, lambda m: m.group(1) + var_value, string)
+
+
+def render_script(template_text, replace_vars):
+    """Fill a MATLAB template (param_config Step 3).
+
+    Returns (script_text, missing): `missing` lists variables the template
+    does not assign (ignored, as param_config did -- camera_len and mag are
+    in neither template). Raises ValueError if a REQUIRED_VARS one is absent.
+    """
+    script, missing = template_text, []
+    for var_name, var_value in replace_vars.items():
+        script, n = replace_single_var(var_name, var_value, script)
+        if n == 0:
+            missing.append(var_name)
+    required_missing = sorted(set(missing) & REQUIRED_VARS)
+    if required_missing:
+        raise ValueError(f"template lacks required variables: {', '.join(required_missing)}")
+    return script, missing
 
 
 def read_params_sheet(param_xlsx):
@@ -305,6 +344,10 @@ def main():
                         default="multislice")
     parser.add_argument("--out-dir", required=True,
                         help="Write one <job_id>.json per scan here")
+    parser.add_argument("--scripts-dir", default=None,
+                        help="Also render run_<job_id>.m per scan here")
+    parser.add_argument("--template", default=None,
+                        help="MATLAB template (default: ./templates/... for --mode)")
     parser.add_argument("--regularization", type=float, default=0.1)
     parser.add_argument("--thickness", type=float, default=13)
     parser.add_argument("--nlayers", type=int, default=2)
@@ -331,6 +374,23 @@ def main():
             json.dump(scan, f, indent=2)
         logger.info(f"Wrote {path} (raw file {'found' if scan['raw_path'] else 'MISSING'})")
     logger.info(f"{len(scans)} scan parameter set(s) written to {args.out_dir}")
+
+    if args.scripts_dir:
+        template = args.template or os.path.join(os.getcwd(), TEMPLATES[args.mode])
+        with open(template, encoding="utf-8") as f:
+            template_text = f.read()
+        os.makedirs(args.scripts_dir, exist_ok=True)
+        for scan in scans:
+            try:
+                script, missing = render_script(template_text, scan["replace_vars"])
+            except ValueError as e:
+                sys.exit(f"Error: {template}: {e}")
+            path = os.path.join(args.scripts_dir, f"{scan['script_name']}.m")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(script)
+            logger.info(f"Wrote {path}")
+        if scans and missing:
+            logger.warning(f"Variables not in template (ignored): {', '.join(missing)}")
     sys.exit(0 if scans else 1)
 
 

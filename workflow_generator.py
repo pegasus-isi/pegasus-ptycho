@@ -8,11 +8,13 @@ MATLAB script and one sbatch file per scan and submitting them by hand, every
 scan listed in "Ptycho parameters.xlsx" that has a matching scan folder becomes
 an independent branch of one Pegasus DAG.
 
-Pipeline steps (per scan, all scans in parallel):
-1. render_script - fill the MATLAB template with this scan's parameters
-2. ptycho_recon  - run fold_slice / PtychoShelves with host MATLAB on one GPU
-Then, once for the whole experiment:
-3. summarize     - collect the per-scan summaries into recon_summary.csv
+At generation time (as param_config did), each scan's MATLAB script is
+rendered from the template into scripts/run_<scan>.m and registered in the
+replica catalog. The workflow then has:
+
+1. ptycho_recon (per scan, in parallel) - run fold_slice / PtychoShelves with
+   host MATLAB on one GPU
+2. summarize (once) - collect the per-scan summaries into recon_summary.csv
 
 The execution site is not described here: the planner downloads it from the
 centrally hosted Pegasus site catalogs (github.com/pegasushub/pegasus-site-catalogs,
@@ -35,6 +37,8 @@ from pathlib import Path
 
 from Pegasus.api import *
 
+import ptycho_params  # pandas/openpyxl are only imported when sheets are read
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,7 +51,6 @@ logger = logging.getLogger(__name__)
 # "tag" selects the matching x-tags profiles (e.g. a GPU queue) from the
 # hosted site catalog for the compute site.
 TOOL_CONFIGS = {
-    "render_script": {"memory": "1 GB", "cores": 1, "container": True, "tag": "cpu"},
     "ptycho_recon": {"memory": "40 GB", "cores": 4, "gpus": 1, "container": False,
                      "tag": "gpu"},
     "summarize": {"memory": "1 GB", "cores": 1, "container": True, "tag": "cpu"},
@@ -63,10 +66,7 @@ KNOWN_HOSTED_CATALOGS = [
     "usc-discovery.yml", "usc-laguna.yml",
 ]
 
-TEMPLATES = {
-    "multislice": "templates/Ptychography_reconstruction_multislice_template.m",
-    "singleslice": "templates/Ptychography_reconstruction_singleslice_template.m",
-}
+TEMPLATES = ptycho_params.TEMPLATES
 
 
 class PtychoWorkflow:
@@ -84,17 +84,16 @@ class PtychoWorkflow:
     local_storage_dir = None
     wf_name = "ptycho"
 
-    def __init__(self, scans, args, dagfile="workflow.yml"):
+    def __init__(self, scans, scripts, args, dagfile="workflow.yml"):
         self.dagfile = dagfile
         self.wf_dir = str(Path(__file__).parent.resolve())
         self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
         self.local_storage_dir = args.output_dir or os.path.join(self.wf_dir, "output")
         self.params_dir = os.path.join(self.wf_dir, "params")
+        self.scripts_dir = os.path.join(self.wf_dir, "scripts")
         self.scans = scans
+        self.scripts = scripts  # job_id -> rendered MATLAB script text
         self.args = args
-
-        self.template_lfn = f"ptycho_{args.mode}_template.m"
-        self.template_path = args.template or os.path.join(self.wf_dir, TEMPLATES[args.mode])
 
     def write(self):
         """Write all catalogs and workflow to files."""
@@ -156,8 +155,8 @@ class PtychoWorkflow:
     def create_transformation_catalog(self, exec_site_name=COMPUTE_SITE):
         self.tc = TransformationCatalog()
 
-        # Container for the small Python steps only. ptycho_recon runs on the
-        # host so it can use the site's licensed MATLAB (module load).
+        # Container for summarize only. ptycho_recon runs on the host so it
+        # can use the site's licensed MATLAB (module load).
         container = None
         if not self.args.no_container:
             container = Container(
@@ -213,22 +212,27 @@ class PtychoWorkflow:
     def create_replica_catalog(self):
         self.rc = ReplicaCatalog()
 
-        self.rc.add_replica("local", self.template_lfn,
-                            "file://" + os.path.abspath(self.template_path))
-
         if any(s["background_subtraction"] == 1 for s in self.scans):
             self.rc.add_replica("local", "background_subtraction.mat",
                                 "file://" + os.path.abspath(self.args.bg_file))
 
         os.makedirs(self.params_dir, exist_ok=True)
+        os.makedirs(self.scripts_dir, exist_ok=True)
         for scan in self.scans:
             sid = scan["job_id"]
 
-            # Per-scan parameters, written now and staged to the render job
+            # Per-scan parameters; ptycho_recon.py uses them to lay out inputs
             params_path = os.path.join(self.params_dir, f"{sid}.json")
             with open(params_path, "w") as f:
                 json.dump(scan, f, indent=2)
             self.rc.add_replica("local", f"{sid}_params.json", "file://" + params_path)
+
+            # Rendered MATLAB script (the old Scripts/run_<scan>.m)
+            script_lfn = f"{scan['script_name']}.m"
+            script_path = os.path.join(self.scripts_dir, script_lfn)
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(self.scripts[sid])
+            self.rc.add_replica("local", script_lfn, "file://" + script_path)
 
             # Raw files share a name across scans (scan_x128_y128.raw), so the
             # LFN is made unique; ptycho_recon.py links it back to its real name.
@@ -245,12 +249,11 @@ class PtychoWorkflow:
     def create_workflow(self):
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
 
-        template = File(self.template_lfn)
         bg_file = File("background_subtraction.mat")
 
         summaries = []
         for scan in self.scans:
-            summaries.append(self._add_scan_pipeline(scan, template, bg_file))
+            summaries.append(self._add_scan_pipeline(scan, bg_file))
 
         summary_csv = File("recon_summary.csv")
         summarize_job = (
@@ -263,8 +266,8 @@ class PtychoWorkflow:
         )
         self.wf.add_jobs(summarize_job)
 
-    def _add_scan_pipeline(self, scan, template, bg_file):
-        """render_script -> ptycho_recon for one scan; returns its summary File."""
+    def _add_scan_pipeline(self, scan, bg_file):
+        """ptycho_recon for one scan; returns its summary File."""
         sid = scan["job_id"]
 
         params = File(f"{sid}_params.json")
@@ -273,15 +276,6 @@ class PtychoWorkflow:
         recon_tar = File(f"{sid}/{sid}_recon.tar.gz")
         matlab_log = File(f"{sid}/{sid}_matlab.log")
         summary = File(f"{sid}_summary.json")
-
-        render_job = (
-            Job("render_script", _id=f"render_{sid}", node_label=f"render_{sid}")
-            .add_pegasus_profile(tag=TOOL_CONFIGS["render_script"]["tag"])
-            .add_args("--template", template, "--params", params, "--output", script)
-            .add_inputs(template, params)
-            .add_outputs(script, stage_out=True, register_replica=False)
-        )
-        self.wf.add_jobs(render_job)
 
         recon_args = [
             "--script", script,
@@ -429,9 +423,9 @@ Examples:
                    help='Extra HTCondor requirements for recon jobs, '
                         'e.g. \'(GPUs_GlobalMemoryMb >= 40000)\'')
     g.add_argument("--container-image", default=os.path.join(wf_dir, "Ptycho_Container.sif"),
-                   help="Apptainer image for the Python steps (default: ./Ptycho_Container.sif)")
+                   help="Apptainer image for summarize (default: ./Ptycho_Container.sif)")
     g.add_argument("--no-container", action="store_true",
-                   help="Run the Python steps with the workers' own python3")
+                   help="Run summarize with the workers' own python3")
     g.add_argument("--retry", type=int, default=1,
                    help="DAGMan retries per job (default: 1)")
 
@@ -470,22 +464,20 @@ Examples:
         logger.warning(f"Container image not built yet: {args.container_image} "
                        "(see README: apptainer build)")
 
-    try:
-        import ptycho_params
-    except ImportError as e:
-        sys.exit(f"Error: {e}. The generator needs pandas and openpyxl "
-                 "(pip install pandas openpyxl).")
-
     defaults = {
         "regularization": args.regularization,
         "thickness": args.thickness,
         "Nlayers": args.nlayers,
         "previous_object": args.previous_object,
     }
-    scans, problems = ptycho_params.collect_scans(
-        args.data_dir, args.params_xlsx, args.rbf_xlsx, args.mode, defaults,
-        acqu_times=set(args.scans) if args.scans else None,
-    )
+    try:
+        scans, problems = ptycho_params.collect_scans(
+            args.data_dir, args.params_xlsx, args.rbf_xlsx, args.mode, defaults,
+            acqu_times=set(args.scans) if args.scans else None,
+        )
+    except ImportError as e:
+        sys.exit(f"Error: {e}. The generator needs pandas and openpyxl "
+                 "(pip install pandas openpyxl).")
 
     for scan in scans:
         if scan["raw_path"] is None:
@@ -505,11 +497,25 @@ Examples:
     if not scans:
         sys.exit("Error: no scans to reconstruct.")
 
+    # Render every scan's MATLAB script now, so template problems surface
+    # before anything is planned or queued.
+    with open(template, encoding="utf-8") as f:
+        template_text = f.read()
+    scripts = {}
+    for scan in scans:
+        try:
+            scripts[scan["job_id"]], missing = ptycho_params.render_script(
+                template_text, scan["replace_vars"])
+        except ValueError as e:
+            sys.exit(f"Error: {template}: {e}")
+    if missing:
+        logger.warning(f"Variables not in template (ignored): {', '.join(missing)}")
+
     logger.info("=" * 70)
     logger.info("PTYCHO WORKFLOW GENERATOR")
     logger.info("=" * 70)
     logger.info(f"Experiment: {args.data_dir}")
-    logger.info(f"Mode:       {args.mode}")
+    logger.info(f"Mode:       {args.mode} ({template})")
     for s in scans:
         logger.info(f"  {s['job_id']}")
     logger.info(f"Scans:      {len(scans)}")
@@ -519,7 +525,7 @@ Examples:
     logger.info("=" * 70)
 
     try:
-        workflow = PtychoWorkflow(scans, args, dagfile=args.output)
+        workflow = PtychoWorkflow(scans, scripts, args, dagfile=args.output)
 
         workflow.create_pegasus_properties()
 
@@ -531,7 +537,8 @@ Examples:
         workflow.create_workflow()
         workflow.write()
 
-        logger.info(f"Workflow written to {args.output}")
+        logger.info(f"Workflow written to {args.output}; "
+                    f"MATLAB scripts in {workflow.scripts_dir}/")
         logger.info(
             f"Submit: pegasus-plan --submit "
             f"-s {args.execution_site_name} -o local {args.output}"
