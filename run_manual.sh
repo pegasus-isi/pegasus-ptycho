@@ -138,11 +138,12 @@ else
     WORK="${OUTPUT_DIR}/${JOB_ID}"
     mkdir -p "${WORK}"
     cp "${SCRIPT}" "${WORK}/"
+    # Place the raw file at its deep LFN, as Pegasus would
+    mkdir -p "${WORK}/Data/${SCAN_FOLDER}"
+    ln -sf "${RAW}" "${WORK}/Data/${SCAN_FOLDER}/$(basename "${RAW}")"
     RECON_ARGS=(
         --script "$(basename "${SCRIPT}")"
-        --scan-folder "${SCAN_FOLDER}"
-        --raw "${RAW}"
-        --raw-name "$(basename "${RAW}")"
+        --raw "Data/${SCAN_FOLDER}/$(basename "${RAW}")"
         --fold-slice "${FOLD_SLICE}"
         --matlab-module "${MATLAB_MODULE}"
         --output-tar "${JOB_ID}/${JOB_ID}_recon.tar.gz"

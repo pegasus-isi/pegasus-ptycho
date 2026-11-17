@@ -213,9 +213,17 @@ placeholders into each script, and `ptycho_recon.py` resolves them on the worker
 | `exp_dir` | `__PEGASUS_JOB_DIR__/` | the job directory |
 | `cSAXS_matlab_path`, `ptycho_matlab_path` | `__FOLD_SLICE_DIR__[/ptycho]` | the transferred (or shared) fold_slice |
 
-Before starting MATLAB, the wrapper links the staged inputs to the paths the
-template reads: `Data/<scan folder>/scan_xN_yN.raw`,
-`Background subtraction.mat`, and `Recon_files/<scan folder>/init_recon.mat`.
+The raw file is registered as a **deep LFN**,
+`Data/<scan folder>/scan_xN_yN.raw`. That is the path the template reads
+(`<exp_dir>/Data/<data_dir>/`), so Pegasus places the file exactly there in
+each job directory. It also keeps raw files from different scans apart even
+though they share a file name. Sheet rows that share an acquisition time
+(`Scan1`, `Scan2`) use the same raw file. The `Data/` prefix comes from the
+template; the experiment folder itself needn't have a `Data/` sub-folder.
+
+Before starting MATLAB, the wrapper links the other staged inputs to the
+paths the template reads: `Background subtraction.mat` and
+`Recon_files/<scan folder>/init_recon.mat`.
 Nothing else in the templates was changed. As in `param_config`, the
 `defocus` value goes into the script exactly as written in the sheet.
 

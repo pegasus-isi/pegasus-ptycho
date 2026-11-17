@@ -358,8 +358,11 @@ class PtychoWorkflow:
 
     def _add_recon_job(self, job_id, scan_folder, script_path, raw_path, raw_name, values):
         script = File(os.path.basename(script_path))
-        # Raw files share a name across scans, so the LFN is made unique
-        raw = File(f"{job_id}_{raw_name}")
+        # Deep LFN: Data/<scan folder>/scan_xN_yN.raw is exactly where the
+        # template reads it (<exp_dir>/Data/<data_dir>/), so Pegasus places it
+        # there in the job directory. It is also unique across scans; rows
+        # sharing an Acqu. Time (Scan1, Scan2) share the same raw file.
+        raw = File(f"Data/{scan_folder}/{raw_name}")
         recon_tar = File(f"{job_id}/{job_id}_recon.tar.gz")
         matlab_log = File(f"{job_id}/{job_id}_matlab.log")
 
@@ -369,8 +372,7 @@ class PtychoWorkflow:
         job = (
             Job("ptycho_recon", _id=f"recon_{job_id}", node_label=f"recon_{job_id}")
             .add_pegasus_profile(tag=RECON_TAG)
-            .add_args("--script", script, "--scan-folder", scan_folder,
-                      "--raw", raw, "--raw-name", raw_name,
+            .add_args("--script", script, "--raw", raw,
                       "--fold-slice", self.args.fold_slice_arg,
                       "--matlab-module", MATLAB_MODULE,
                       "--output-tar", recon_tar, "--log", matlab_log)

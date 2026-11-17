@@ -10,7 +10,7 @@ this wrapper lays them out the way the MATLAB template expects:
     <job dir>/
         run_<scan>.m                               (placeholders resolved)
         Background subtraction.mat                 -> staged background file
-        Data/<scan folder>/scan_xN_yN.raw          -> staged raw file
+        Data/<scan folder>/scan_xN_yN.raw          staged raw file (deep LFN)
         Recon_files/<scan folder>/init_recon.mat   -> staged previous recon
         Recon_result/...                           (written by MATLAB)
 
@@ -55,11 +55,8 @@ def tail(path, n=60):
 def main():
     parser = argparse.ArgumentParser(description="Ptycho reconstruction (MATLAB, GPU)")
     parser.add_argument("--script", required=True, help="Rendered run_<scan>.m")
-    parser.add_argument("--scan-folder", required=True,
-                        help="Scan folder name (data_dir in the MATLAB script)")
-    parser.add_argument("--raw", required=True, help="Staged raw 4D-STEM file")
-    parser.add_argument("--raw-name", required=True,
-                        help="Name the script reads, e.g. scan_x128_y128.raw")
+    parser.add_argument("--raw", required=True,
+                        help="Staged raw 4D-STEM file, Data/<scan folder>/scan_xN_yN.raw")
     parser.add_argument("--bg-file", default=None,
                         help="Staged 'Background subtraction.mat'")
     parser.add_argument("--init-recon", default=None,
@@ -83,11 +80,16 @@ def main():
         sys.exit(1)
 
     # --- Lay out inputs where the template expects them -----------------
-    link(args.raw, os.path.join("Data", args.scan_folder, args.raw_name))
+    # The raw file is already in place: its deep LFN is the path the template
+    # reads, Data/<scan folder>/scan_xN_yN.raw
+    if not os.path.isfile(args.raw):
+        logger.error(f"Raw file not found at {args.raw}")
+        sys.exit(1)
+    scan_folder = os.path.basename(os.path.dirname(args.raw))
     if args.bg_file:
         link(args.bg_file, "Background subtraction.mat")
     if args.init_recon:
-        link(args.init_recon, os.path.join("Recon_files", args.scan_folder, "init_recon.mat"))
+        link(args.init_recon, os.path.join("Recon_files", scan_folder, "init_recon.mat"))
 
     # --- Resolve worker-side placeholders -------------------------------
     with open(args.script, encoding="utf-8") as f:
