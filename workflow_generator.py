@@ -43,7 +43,9 @@ TEMPLATES = {
     "singleslice": "templates/Ptychography_reconstruction_singleslice_template.m",
 }
 RBF_XLSX = "config/rbf.xlsx"
-MATLAB_MODULE = "matlab/2021b"  # '' if matlab is already on PATH
+# Sourced by PegasusLite on the worker before each job (e.g. module load
+# matlab); shipped from the submit host by HTCondor
+JOB_ENV_SETUP = "job-env-setup.sh"
 
 # As the old sbatch file: --cpus-per-task=4 --gpus-per-task=1
 # --mem-per-gpu=40GB --time=4:00:00. The "gpu" tag picks the gpu x-tags
@@ -190,6 +192,10 @@ class PtychoWorkflow:
         self.props["dagman.retry"] = "1"
         # Download the compute site from the hosted site catalogs
         self.props["pegasus.catalog.site.repo.file"] = self.args.site_catalog_file
+        # The setup script PegasusLite sources: a pegasus_lite_env_source profile
+        # on site local (a path on the submit host), set through the properties
+        #self.props["pegasus.pegasus_lite_env_source"] = os.path.join(self.wf_dir, JOB_ENV_SETUP)
+        self.props.add_site_profile(site="local", namespace="pegasus",  key="pegasus_lite_env_source", value= os.path.join(self.wf_dir, JOB_ENV_SETUP) )
 
     # ------------------------------------------------------------------
     # Site Catalog — only the submit host; "compute" is downloaded
@@ -368,7 +374,6 @@ class PtychoWorkflow:
             Job("ptycho_recon", _id=f"recon_{job_id}", node_label=f"recon_{job_id}")
             .add_pegasus_profile(tag=RECON_TAG)
             .add_args("--script", script, "--raw", raw,
-                      "--matlab-module", MATLAB_MODULE,
                       "--output-tar", recon_tar, "--log", matlab_log)
             .add_inputs(script, raw)
             .add_outputs(recon_tar, matlab_log, stage_out=True, register_replica=False)
@@ -445,6 +450,9 @@ Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
                        "background_subtraction=1 will be skipped (use --bg-file)")
     if not os.path.isfile(args.params_xlsx):
         parser.error(f"not found: {args.params_xlsx}")
+    env_setup = Path(__file__).parent.resolve() / JOB_ENV_SETUP
+    if not env_setup.is_file():
+        parser.error(f"not found: {env_setup}")
     # A path on the workers, so it is not checked here
     args.fold_slice_dir = args.fold_slice_dir.rstrip("/")
     if not os.path.isabs(args.fold_slice_dir):

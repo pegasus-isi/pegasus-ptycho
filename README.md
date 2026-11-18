@@ -53,7 +53,7 @@ pegasus-ptycho/
 - [Pegasus WMS](https://pegasus.isi.edu/) >= 5.1.3 and [HTCondor](https://htcondor.org/) >= 10.2 on the submit host. 5.1.3 is the first release with [hosted site catalogs](https://pegasus.isi.edu/docs/5.1.3/reference-guide/catalogs.html#centrally-hosted-site-catalogs) and job tagging. The planner also needs outbound HTTPS to GitHub.
 - Python 3.8+ with `pandas` and `openpyxl` on the submit host (the generator reads the `.xlsx` files)
 - A compute resource described by one of the hosted site catalogs (an HTCondor pool or a SLURM cluster), with GPUs. On the GPU workers:
-  - MATLAB with the Parallel Computing Toolbox, through `module load matlab/2021b` or on `PATH`
+  - MATLAB with the Parallel Computing Toolbox, put on `PATH` by `job-env-setup.sh` (see below)
   - `python3`
 - A fold_slice checkout on a filesystem shared by the GPU workers
 
@@ -100,10 +100,21 @@ top of `workflow_generator.py`:
 |----------|---------|---------|
 | `TEMPLATES` | `templates/...` | MATLAB template per `--mode` |
 | `RBF_XLSX` | `config/rbf.xlsx` | rbf calibration table |
-| `MATLAB_MODULE` | `matlab/2021b` | Module loaded before MATLAB (`''` if `matlab` is on `PATH`) |
+| `JOB_ENV_SETUP` | `job-env-setup.sh` | Setup script PegasusLite sources before each job |
 | `RECON_RESOURCES` | 40 GB, 4 cores, 1 GPU, 14400 s | Per recon job, as in the old sbatch file |
 | `RECON_TAG` | `gpu` | Job tag that selects the hosted catalog's GPU profiles |
 | `MULTISLICE_DEFAULTS` | `0`, `0.1`, `13`, `2` | previous_object, regularization, thickness, Nlayers |
+
+### Job environment: `job-env-setup.sh`
+
+`job-env-setup.sh`, next to the generator, sets up the environment on the
+worker, e.g. `module load matlab`. Through the properties, the generator
+gives site `local` a `pegasus_lite_env_source` profile pointing at it
+(`pegasus.catalog.site.sites.local.profiles.pegasus.pegasus_lite_env_source`),
+so HTCondor ships it with every job and PegasusLite sources it before the job
+starts. `ptycho_recon.py` then just
+runs `matlab` from `PATH`. Edit the script to suit the resource, e.g.
+`module load matlab/2021b`.
 
 ## Execution site: hosted site catalogs
 
@@ -232,8 +243,9 @@ Nothing else in the templates was changed. As in `param_config`, the
 
 This generates the workflow and renders the scripts, and runs anywhere. To also run the
 MATLAB reconstruction, run it on a GPU node with MATLAB and add
-`--fold-slice /path/to/fold_slice --matlab-module matlab/2021b`, where the
-path is where fold_slice lives on that node.
+`--fold-slice /path/to/fold_slice`, where the path is where fold_slice lives
+on that node. As PegasusLite does, the test sources `job-env-setup.sh` before
+the reconstruction; use `--env-setup FILE` for a different script.
 
 The bundled `Sample dataset` has no `Background subtraction.mat`, so pass
 one with `--bg-file` or its scan 1302 is skipped. Its scan 0102 has no raw file.

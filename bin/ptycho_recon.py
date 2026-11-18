@@ -60,8 +60,6 @@ def main():
                         help="Staged 'Background subtraction.mat'")
     parser.add_argument("--init-recon", default=None,
                         help="Staged previous reconstruction (initial_probe=1)")
-    parser.add_argument("--matlab-module", default="",
-                        help="Environment module to load first (e.g. matlab/2021b)")
     parser.add_argument("--output-tar", required=True, help="Recon_result tarball")
     parser.add_argument("--log", required=True, help="MATLAB log file")
     args = parser.parse_args()
@@ -99,11 +97,8 @@ def main():
     if shutil.which("nvidia-smi"):
         subprocess.run(["nvidia-smi", "-L"])
 
-    matlab = f"matlab -batch {script_name}"
-    if args.matlab_module:
-        cmd = ["bash", "-lc", f"module load {args.matlab_module} && {matlab}"]
-    else:
-        cmd = ["bash", "-c", matlab]
+    # matlab is on PATH: PegasusLite has sourced job-env-setup.sh
+    cmd = ["matlab", "-batch", script_name]
 
     for path in (args.log, args.output_tar):
         if os.path.dirname(path):

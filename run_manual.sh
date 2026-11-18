@@ -11,7 +11,7 @@
 # Usage:
 #   ./run_manual.sh --data-dir "/path/to/experiment/" [--mode multislice|singleslice]
 #                   [--scan ACQU_TIME] [--fold-slice /path/to/fold_slice]
-#                   [--matlab-module matlab/2021b] [--bg-file FILE]
+#                   [--env-setup FILE] [--bg-file FILE]
 #
 # Example (no MATLAB run):
 #   ./run_manual.sh --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" --scan 1302
@@ -26,7 +26,7 @@ DATA_DIR=""
 MODE="multislice"
 SCAN=""
 FOLD_SLICE=""
-MATLAB_MODULE=""
+ENV_SETUP="${SCRIPT_DIR}/job-env-setup.sh"
 BG_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -35,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --mode)          MODE="$2"; shift 2 ;;
         --scan)          SCAN="$2"; shift 2 ;;
         --fold-slice)    FOLD_SLICE="$2"; shift 2 ;;
-        --matlab-module) MATLAB_MODULE="$2"; shift 2 ;;
+        --env-setup)     ENV_SETUP="$2"; shift 2 ;;
         --bg-file)       BG_FILE="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
@@ -140,14 +140,14 @@ else
     RECON_ARGS=(
         --script "$(basename "${SCRIPT}")"
         --raw "Data/${SCAN_FOLDER}/$(basename "${RAW}")"
-        --matlab-module "${MATLAB_MODULE}"
         --output-tar "${JOB_ID}/${JOB_ID}_recon.tar.gz"
         --log "${JOB_ID}/${JOB_ID}_matlab.log"
     )
     if [ -f "${BG_FILE}" ]; then
         RECON_ARGS+=(--bg-file "${BG_FILE}")
     fi
-    ( cd "${WORK}" && python3 "${SCRIPT_DIR}/bin/ptycho_recon.py" "${RECON_ARGS[@]}" )
+    # Source the job setup script first, as PegasusLite does
+    ( cd "${WORK}" && source "${ENV_SETUP}" && python3 "${SCRIPT_DIR}/bin/ptycho_recon.py" "${RECON_ARGS[@]}" )
     check_file "${WORK}/${JOB_ID}/${JOB_ID}_recon.tar.gz" "ptycho_recon"
 fi
 
