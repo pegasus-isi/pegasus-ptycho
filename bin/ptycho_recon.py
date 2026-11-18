@@ -18,6 +18,7 @@ then runs MATLAB and packs Recon_result/ into a single tarball for stage-out.
 """
 
 import argparse
+import glob
 import logging
 import os
 import shutil
@@ -32,6 +33,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 JOB_DIR_TOKEN = "__PEGASUS_JOB_DIR__"
+
+# PtychoShelves catches its own errors, prints this and lets MATLAB exit 0
+RECON_STOPPED = "Reconstruction stopped!"
+# Diffraction data the template prepares for PtychoShelves; as large as the
+# raw file, so it is not returned
+DP_SUFFIX = "_dp.hdf5"
 
 
 def link(src, dst):
@@ -113,10 +120,21 @@ def main():
         print(tail(args.log), file=sys.stderr)
         sys.exit(result.returncode)
 
+    # A MATLAB exit code of 0 does not mean the reconstruction ran
+    with open(args.log, errors="replace") as f:
+        stopped = RECON_STOPPED in f.read()
+    iterations = glob.glob("Recon_result/**/Niter*.mat", recursive=True)
+    if stopped or not iterations:
+        reason = f"'{RECON_STOPPED}' in the MATLAB log" if stopped else "no Niter*.mat written"
+        logger.error(f"Reconstruction failed: {reason}")
+        print(tail(args.log), file=sys.stderr)
+        sys.exit(1)
+
     # --- Package results -------------------------------------------------
-    logger.info(f"Packing Recon_result/ into {args.output_tar}")
+    logger.info(f"Packing Recon_result/ into {args.output_tar} (without *{DP_SUFFIX})")
     with tarfile.open(args.output_tar, "w:gz") as tar:
-        tar.add("Recon_result", arcname=script_name)
+        tar.add("Recon_result", arcname=script_name,
+                filter=lambda ti: None if ti.name.endswith(DP_SUFFIX) else ti)
 
     logger.info(f"Output: {args.output_tar}")
 

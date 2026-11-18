@@ -187,7 +187,9 @@ dp = reshape(dp, Ndpx, Ndpy, []); %PtychoShelves actually takes this 3D shape
 
 %% Step 4: save 4D-STEM in a .hdf5 file (needed by Ptychoshelves)
 
-save_dir = strcat(base_path,'Scan_',num2str(scan_number),'/');
+% Pegasus: written under result_path (= p.base_path), where upstream fold_slice
+% (scans.get_filenames_cu) reads it; was base_path
+save_dir = strcat(result_path,'Scan_',num2str(scan_number),'/');
 roi_label = sprintf('%i_Ndp%i_step%i', scan_number, Ndpx, Npx);
 saveName = strcat('data_roi',roi_label,'_dp.hdf5');
 dp_dir = strcat(save_dir,saveName);

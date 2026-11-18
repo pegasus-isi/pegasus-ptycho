@@ -207,11 +207,17 @@ Final outputs are staged to `output/`:
 
 | Output | Description |
 |--------|-------------|
-| `<scan>_Scan<n>/<scan>_Scan<n>_recon.tar.gz` | The whole `Recon_result/` tree: `init_probe_*.mat`, `*_params.mat`, the `Reduced_run_*` / `Full_run_*` iterations, and the script with paths resolved. |
+| `<scan>_Scan<n>/<scan>_Scan<n>_recon.tar.gz` | The `Recon_result/` tree: `init_probe_*.mat`, `*_params.mat`, the `Reduced_run_*` / `Full_run_*` iterations, and the script with paths resolved. |
 | `<scan>_Scan<n>/<scan>_Scan<n>_matlab.log` | MATLAB stdout/stderr (the old `Log/Data_<scan>.txt`). |
 
-The intermediate `data_roi*_dp.hdf5` that the template writes next to the raw
-data stays on the worker. It is not staged back.
+The intermediate `data_roi*_dp.hdf5` (the prepared diffraction data, about the
+size of the raw file) is left out of the tarball and stays on the worker.
+
+**Failed reconstructions fail the job.** PtychoShelves catches its own errors,
+prints `Reconstruction stopped!` and lets MATLAB exit 0. `ptycho_recon.py`
+therefore also fails the job when the MATLAB log contains that line or no
+`Niter*.mat` was written, and prints the end of the log to stderr (see
+`pegasus-analyzer`). With `dagman.retry = 1` the job is retried once.
 
 ## How the template is adapted to Pegasus
 
@@ -232,6 +238,13 @@ template; the experiment folder itself needn't have a `Data/` sub-folder.
 Before starting MATLAB, the wrapper links the other staged inputs to the
 paths the template reads: `Background subtraction.mat` and
 `Recon_files/<scan folder>/init_recon.mat`.
+One line of Step 4 is changed in both templates: `save_dir` is under
+`result_path` instead of `base_path`. The templates write the prepared
+diffraction data (`Scan_<n>/data_roi*_dp.hdf5`) and set `p.hdf5_path` for a
+modified fold_slice; upstream
+[fold_slice](https://github.com/yijiang1/fold_slice) reads it from
+`p.base_path` (= `result_path`) instead (`scans.get_filenames_cu`), and with
+the original line fails with `Failed to load dp from …`.
 Nothing else in the templates was changed. As in `param_config`, the
 `defocus` value goes into the script exactly as written in the sheet.
 
