@@ -106,9 +106,11 @@ def reconstruct(args, script_name):
     # A MATLAB exit code of 0 does not mean the reconstruction ran
     with open(args.log, errors="replace") as f:
         stopped = RECON_STOPPED in f.read()
-    iterations = glob.glob("Recon_result/**/Niter*.mat", recursive=True)
+    # The engines save sprintf([eng.fout 'Niter%d.mat']), and the templates set
+    # eng.fout without a trailing slash: Full_run_Ndp_128Niter2000.mat
+    iterations = glob.glob("Recon_result/**/*Niter[0-9]*.mat", recursive=True)
     if stopped or not iterations:
-        reason = f"'{RECON_STOPPED}' in the MATLAB log" if stopped else "no Niter*.mat written"
+        reason = f"'{RECON_STOPPED}' in the MATLAB log" if stopped else "no *Niter<N>.mat written"
         logger.error(f"Reconstruction failed: {reason}")
         print(tail(args.log), file=sys.stderr)
         return 1

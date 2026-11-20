@@ -216,7 +216,7 @@ size of the raw file) is left out of the tarball and stays on the worker.
 **Failed reconstructions fail the job.** PtychoShelves catches its own errors,
 prints `Reconstruction stopped!` and lets MATLAB exit 0. `ptycho_recon.py`
 therefore also fails the job when the MATLAB log contains that line or no
-`Niter*.mat` was written, and prints the end of the log to stderr (see
+`*Niter<N>.mat` (e.g. `Full_run_Ndp_128Niter2000.mat`) was written, and prints the end of the log to stderr (see
 `pegasus-analyzer`). With `dagman.retry = 1` the job is retried once.
 
 **Outputs of a failed job.** The tarball (whatever `Recon_result/` holds) and
