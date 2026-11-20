@@ -219,6 +219,12 @@ therefore also fails the job when the MATLAB log contains that line or no
 `Niter*.mat` was written, and prints the end of the log to stderr (see
 `pegasus-analyzer`). With `dagman.retry = 1` the job is retried once.
 
+**Outputs of a failed job.** The tarball (whatever `Recon_result/` holds) and
+the MATLAB log are written even when the job fails. HTCondor returns them to
+the workflow's scratch directory on the submit host,
+`scratch/<user>/pegasus/ptycho/runNNNN/<scan>_Scan<n>/`, but Pegasus does not
+stage a failed job's outputs to `output/`. A retry overwrites them.
+
 ## How the template is adapted to Pegasus
 
 Pegasus runs each job in its own scratch directory, so the hard-coded
