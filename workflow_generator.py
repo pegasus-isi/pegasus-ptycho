@@ -4,11 +4,13 @@
 Pegasus workflow generator for electron ptychography reconstruction.
 
 Pegasus version of param_config_multislice.py: the same loop over scan folders
-and "Ptycho parameters.xlsx" rows writes Scripts/run_<scan>_Scan<n>.m from the
-MATLAB template, but instead of an sbatch line per scan it adds a Pegasus job:
+and "Ptycho parameters.xlsx" rows works out each scan's template values, but
+writes them into Params/<scan>_Scan<n>.json instead of a copy of the template,
+and instead of an sbatch line per scan it adds a Pegasus job:
 
-    ptycho_recon (one per scan, all in parallel) - run the script with host
-    MATLAB + fold_slice on one GPU, return Recon_result/ as a tarball
+    ptycho_recon (one per scan, all in parallel) - run the compiled
+    reconstruction (app/build_app.sh) on the parameter file in the MATLAB
+    Runtime container on one GPU, return Recon_result/ as a tarball
 
 The execution site comes from the centrally hosted Pegasus site catalogs
 (github.com/pegasushub/pegasus-site-catalogs, property
@@ -16,7 +18,8 @@ pegasus.catalog.site.repo.file); jobs are planned for the site "compute".
 
 Usage:
     ./workflow_generator.py --data-dir "/scratch/zhangych/Data/" \\
-        --site-catalog-file access-pegasus.yml --fold-slice-dir /home/zhangych/fold_slice
+        --site-catalog-file usc-discovery.yml \\
+        --container-image /project/<group>/matlab-runtime-R2025b.sif
 """
 
 import argparse
@@ -28,6 +31,8 @@ from pathlib import Path
 
 from Pegasus.api import *
 
+from ptycho_params import MULTISLICE_HEADER, TEMPLATES, write_params
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -38,14 +43,9 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # Settings (edit here, as code_dir / sbatch settings in the old scripts)
 # ----------------------------------------------------------------------
-TEMPLATES = {
-    "multislice": "templates/Ptychography_reconstruction_multislice_template.m",
-    "singleslice": "templates/Ptychography_reconstruction_singleslice_template.m",
-}
 RBF_XLSX = "config/rbf.xlsx"
-# Sourced by PegasusLite on the worker before each job (e.g. module load
-# matlab); shipped from the submit host by HTCondor
-JOB_ENV_SETUP = "job-env-setup.sh"
+# The compiled reconstruction (app/build_app.sh), staged to each job
+APP = "app/build/ptycho_recon_app"
 
 # As the old sbatch file: --cpus-per-task=4 --gpus-per-task=1
 # --mem-per-gpu=40GB --time=4:00:00. The "gpu" tag picks the gpu x-tags
@@ -60,10 +60,6 @@ MULTISLICE_DEFAULTS = {
 
 COMPUTE_SITE = "compute"
 
-# Placeholder for the job directory, only known on the worker; resolved by
-# ptycho_recon.py
-JOB_DIR_TOKEN = "__PEGASUS_JOB_DIR__"
-
 # Sheet columns. The current sheets have 28 columns; a 32-column sheet also
 # has the four multislice columns after initial_probe.
 PARAM_HEADER = [
@@ -74,18 +70,8 @@ PARAM_HEADER = [
     "background_subtraction", "Niter", "Probe_states", "Probe_modes",
     "GPU_solver", "errmetric", "initial_probe",
 ]
-MULTISLICE_HEADER = ["previous_object", "regularization", "thickness", "Nlayers"]
 TRAILING_HEADER = ["Result", "Notes"]
 RBF_HEADER = ["voltage", "camera_len", "conv_angle", "rbf"]
-
-REPLACE_VARS = [
-    "rot_ang", "camera_len", "dScanX", "dScanY", "exp_dir",
-    "data_dir", "N_scan_x", "N_scan_y", "voltage", "ADU", "alpha0",
-    "rbf", "scan_step_size", "data_descriptor", "mag", "scan_number",
-    "resample_factor", "defocus", "background_subtraction", "Niter",
-    "Np_crop_pad", "Nprobe", "variable_probe_modes", "GPU_solver",
-    "errmetric", "initial_probe", "cSAXS_matlab_path", "ptycho_matlab_path",
-]
 
 
 # ----------------------------------------------------------------------
@@ -145,12 +131,6 @@ def get_scan_step_size(mag, N_scan_x):
         print(f"mag({mag}) not found, scan_step_size not defined!")
 
 
-def replace_single_var(var_name, var_value, string):
-    """Same regex as param_config: replace the value of `\\n<var> = ...`."""
-    return re.sub(r"(\n{}( )*=( )*['|\"|\[]?)[^\n|^;|^'|^\"|^\]]*".format(var_name),
-                  lambda m: m.group(1) + var_value, string)
-
-
 class PtychoWorkflow:
     """One ptycho_recon job per (scan folder, spreadsheet row)."""
 
@@ -171,7 +151,7 @@ class PtychoWorkflow:
         self.wf_dir = str(Path(__file__).parent.resolve())
         self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
         self.local_storage_dir = os.path.join(self.wf_dir, "output")
-        self.script_dir = os.path.join(self.wf_dir, "Scripts")
+        self.params_dir = os.path.join(self.wf_dir, "Params")
         self.args = args
 
     def write(self):
@@ -192,10 +172,10 @@ class PtychoWorkflow:
         self.props["dagman.retry"] = "1"
         # Download the compute site from the hosted site catalogs
         self.props["pegasus.catalog.site.repo.file"] = self.args.site_catalog_file
-        # The setup script PegasusLite sources: a pegasus_lite_env_source profile
-        # on site local (a path on the submit host), set through the properties
-        #self.props["pegasus.pegasus_lite_env_source"] = os.path.join(self.wf_dir, JOB_ENV_SETUP)
-        self.props.add_site_profile(site="local", namespace="pegasus",  key="pegasus_lite_env_source", value= os.path.join(self.wf_dir, JOB_ENV_SETUP) )
+        # Symlink the container image into each job instead of copying it. Only
+        # the image is linked: the job's input files are still copied, as the
+        # container sees only the job directory.
+        self.props["pegasus.transfer.links"] = "true"
 
     # ------------------------------------------------------------------
     # Site Catalog — only the submit host; "compute" is downloaded
@@ -224,12 +204,24 @@ class PtychoWorkflow:
     def create_transformation_catalog(self, exec_site_name=COMPUTE_SITE):
         self.tc = TransformationCatalog()
 
-        # No container: MATLAB is licensed, so the job uses the site's MATLAB
+        # The MATLAB Runtime image (container/apptainer.def), already on the
+        # workers' shared filesystem: linked into each job, not staged. Pegasus
+        # adds --nv for the GPU itself, as the job requests gpus.
+        runtime = Container(
+            "matlab_runtime",
+            Container.SINGULARITY,
+            image="file://" + self.args.container_image,
+            image_site=exec_site_name,
+            bypass_staging=True,
+        )
+        self.tc.add_containers(runtime)
+
         ptycho_recon = Transformation(
             "ptycho_recon",
             site=exec_site_name,
             pfn=os.path.join(self.wf_dir, "bin/ptycho_recon.py"),
             is_stageable=True,
+            container=runtime,
         ).add_pegasus_profile(**RECON_RESOURCES)
 
         self.tc.add_transformations(ptycho_recon)
@@ -239,6 +231,10 @@ class PtychoWorkflow:
     # ------------------------------------------------------------------
     def create_replica_catalog(self):
         self.rc = ReplicaCatalog()
+
+        # One compiled app for all scans
+        self.app = File(os.path.basename(APP))
+        self.rc.add_replica("local", self.app, "file://" + self.args.app)
 
         self.bg_file = None
         bg_path = self.args.bg_file
@@ -255,7 +251,7 @@ class PtychoWorkflow:
         self.wf = Workflow(self.wf_name, infer_dependencies=True)
         main_dir = self.args.data_dir
         mode = self.args.mode
-        os.makedirs(self.script_dir, exist_ok=True)
+        os.makedirs(self.params_dir, exist_ok=True)
 
         # Step 1: read table header
         param_df = pd.read_excel(self.args.params_xlsx)
@@ -263,9 +259,6 @@ class PtychoWorkflow:
         param_df.columns = (PARAM_HEADER + (MULTISLICE_HEADER if multislice_cols else [])
                             + TRAILING_HEADER)[:param_df.shape[1]]
         rbf_df = pd.read_excel(os.path.join(self.wf_dir, RBF_XLSX), names=RBF_HEADER)
-
-        with open(os.path.join(self.wf_dir, TEMPLATES[mode]), "r", encoding="utf-8") as file:
-            template_str = file.read()
 
         # Only folders whose name starts with a number (the Acqu. Time) are scans
         scan_folders = [f for f in next(os.walk(main_dir))[1] if f.split("_")[0].isdigit()]
@@ -295,7 +288,6 @@ class PtychoWorkflow:
                     "camera_len": row["Camera_len"],
                     "dScanX": row["dScanXY"],
                     "dScanY": row["dScanXY"],
-                    "exp_dir": f"{JOB_DIR_TOKEN}/",
                     "data_dir": scan_folder,
                     "N_scan_x": int(row["Scan_size"]),
                     "N_scan_y": int(row["Scan_size"]),
@@ -313,20 +305,16 @@ class PtychoWorkflow:
                     "defocus": row["Defocus"],
                     "background_subtraction": int(row["background_subtraction"]),
                     "Niter": row["Niter"],
-                    "Np_crop_pad": f"{row['Diff_pattern_size']},{row['Diff_pattern_size']}",
+                    "Np_crop_pad": [row["Diff_pattern_size"], row["Diff_pattern_size"]],
                     "Nprobe": row["Probe_states"],
                     "variable_probe_modes": row["Probe_modes"],
                     "GPU_solver": row["GPU_solver"],
                     "errmetric": row["errmetric"],
                     "initial_probe": int(row["initial_probe"]),
-                    "cSAXS_matlab_path": self.args.fold_slice_dir,
-                    "ptycho_matlab_path": f"{self.args.fold_slice_dir}/ptycho",
                 }
-                replace_vars = list(REPLACE_VARS)
                 if mode == "multislice":
                     for col in MULTISLICE_HEADER:
                         values[col] = row[col] if multislice_cols else MULTISLICE_DEFAULTS[col]
-                    replace_vars += MULTISLICE_HEADER
 
                 if any(values[v] is None for v in ("ADU", "alpha0", "rbf", "scan_step_size")):
                     print(f"{job_id}: skipped (see message above)")
@@ -342,23 +330,18 @@ class PtychoWorkflow:
                           f"{self.args.bg_file} not found (use --bg-file), skipped")
                     continue
 
-                # Step 3: replace variables
-                file_str = template_str
-                for var_name in replace_vars:
-                    file_str = replace_single_var(var_name, str(values[var_name]), file_str)
-
-                script_path = os.path.join(self.script_dir, f"run_{job_id}.m")
-                with open(script_path, "w", encoding="utf-8") as file:
-                    file.write(file_str)
+                # Step 3: write the values (was: replaced in a copy of the template)
+                params_path = os.path.join(self.params_dir, f"{job_id}.json")
+                write_params(params_path, mode, values)
 
                 # Step 4: add the reconstruction job (was: a line in the sbatch file)
-                self._add_recon_job(job_id, scan_folder, script_path, raw_path,
+                self._add_recon_job(job_id, scan_folder, params_path, raw_path,
                                     raw_name, values)
 
-        print(f"{len(self.wf.jobs)} jobs added, scripts in {self.script_dir}/")
+        print(f"{len(self.wf.jobs)} jobs added, parameter files in {self.params_dir}/")
 
-    def _add_recon_job(self, job_id, scan_folder, script_path, raw_path, raw_name, values):
-        script = File(os.path.basename(script_path))
+    def _add_recon_job(self, job_id, scan_folder, params_path, raw_path, raw_name, values):
+        params = File(os.path.basename(params_path))
         # Deep LFN: Data/<scan folder>/scan_xN_yN.raw is exactly where the
         # template reads it (<exp_dir>/Data/<data_dir>/), so Pegasus places it
         # there in the job directory. It is also unique across scans; rows
@@ -367,15 +350,15 @@ class PtychoWorkflow:
         recon_tar = File(f"{job_id}/{job_id}_recon.tar.gz")
         matlab_log = File(f"{job_id}/{job_id}_matlab.log")
 
-        self.rc.add_replica("local", script, "file://" + script_path)
+        self.rc.add_replica("local", params, "file://" + params_path)
         self.rc.add_replica("local", raw, "file://" + raw_path)
 
         job = (
             Job("ptycho_recon", _id=f"recon_{job_id}", node_label=f"recon_{job_id}")
             .add_pegasus_profile(tag=RECON_TAG)
-            .add_args("--script", script, "--raw", raw,
+            .add_args("--app", self.app, "--params", params, "--raw", raw,
                       "--output-tar", recon_tar, "--log", matlab_log)
-            .add_inputs(script, raw)
+            .add_inputs(self.app, params, raw)
             .add_outputs(recon_tar, matlab_log, stage_out=True, register_replica=False)
         )
 
@@ -404,10 +387,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file access-pegasus.yml \\
-      --fold-slice-dir /home/zhangych/fold_slice
   %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file usc-discovery.yml \\
-      --fold-slice-dir /home/zhangych/fold_slice --mode singleslice
+      --container-image /project/<group>/matlab-runtime-R2025b.sif
+  %(prog)s --data-dir /scratch/zhangych/Data/ --site-catalog-file usc-discovery.yml \\
+      --container-image /project/<group>/matlab-runtime-R2025b.sif --mode singleslice
 
 Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
 """,
@@ -430,9 +413,12 @@ Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
     parser.add_argument("--site-catalog-file", required=True,
                         help="Hosted site catalog (pegasushub/pegasus-site-catalogs conf/), "
                              "e.g. access-pegasus.yml, usc-discovery.yml")
-    parser.add_argument("--fold-slice-dir", required=True,
-                        help="fold_slice directory on the workers' shared filesystem "
-                             "(written into the MATLAB scripts)")
+    parser.add_argument("--container-image", required=True,
+                        help="MATLAB Runtime image (container/apptainer.def) on the "
+                             "workers' shared filesystem, of the release the app was "
+                             "compiled with")
+    parser.add_argument("--app", default=None,
+                        help=f"Compiled reconstruction, from app/build_app.sh (default: {APP})")
     parser.add_argument("--bg-file", default=None,
                         help='Background file (default: <data-dir>/"Background subtraction.mat")')
     parser.add_argument("--mode", choices=sorted(TEMPLATES), default="multislice",
@@ -450,14 +436,13 @@ Then: pegasus-plan --submit --sites compute --output-sites local workflow.yml
                        "background_subtraction=1 will be skipped (use --bg-file)")
     if not os.path.isfile(args.params_xlsx):
         parser.error(f"not found: {args.params_xlsx}")
-    env_setup = Path(__file__).parent.resolve() / JOB_ENV_SETUP
-    if not env_setup.is_file():
-        parser.error(f"not found: {env_setup}")
+    args.app = os.path.abspath(args.app or Path(__file__).parent.resolve() / APP)
+    if not os.path.isfile(args.app):
+        parser.error(f"not found: {args.app} (build it with app/build_app.sh)")
     # A path on the workers, so it is not checked here
-    args.fold_slice_dir = args.fold_slice_dir.rstrip("/")
-    if not os.path.isabs(args.fold_slice_dir):
-        parser.error(f"--fold-slice-dir must be an absolute path on the workers: "
-                     f"{args.fold_slice_dir}")
+    if not os.path.isabs(args.container_image):
+        parser.error(f"--container-image must be an absolute path on the workers: "
+                     f"{args.container_image}")
 
     logger.info("=" * 70)
     logger.info("PTYCHO WORKFLOW GENERATOR")

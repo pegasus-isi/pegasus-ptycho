@@ -3,15 +3,16 @@
 # Manual test script for the ptycho workflow.
 # Runs the pipeline locally, the way Pegasus would, before submitting.
 #
-# Step 0 (workflow generation + MATLAB script rendering) needs python3 with
-# the Pegasus Python API, pandas and openpyxl, and runs anywhere.
-# Step 1 (the MATLAB reconstruction) needs a GPU node with MATLAB and
-# fold_slice; it is skipped unless --fold-slice is given.
+# Step 0 (workflow generation + parameter files) needs python3 with the
+# Pegasus Python API, pandas and openpyxl, and runs anywhere.
+# Step 1 (the reconstruction) needs a GPU node with Apptainer, the compiled
+# app (app/build_app.sh) and the MATLAB Runtime image (container/apptainer.def);
+# it is skipped unless --image is given.
 #
 # Usage:
 #   ./run_manual.sh --data-dir "/path/to/experiment/" [--mode multislice|singleslice]
-#                   [--scan ACQU_TIME] [--fold-slice /path/to/fold_slice]
-#                   [--env-setup FILE] [--bg-file FILE]
+#                   [--scan ACQU_TIME] [--image matlab-runtime-R2025b.sif]
+#                   [--app app/build/ptycho_recon_app] [--bg-file FILE]
 #
 # Example (no MATLAB run):
 #   ./run_manual.sh --data-dir "/scratch/zhangych/Data/20230805_WSe2_EMPAD/" --scan 1302
@@ -25,8 +26,8 @@ OUTPUT_DIR="${SCRIPT_DIR}/test_output"
 DATA_DIR=""
 MODE="multislice"
 SCAN=""
-FOLD_SLICE=""
-ENV_SETUP="${SCRIPT_DIR}/job-env-setup.sh"
+IMAGE=""
+APP="${SCRIPT_DIR}/app/build/ptycho_recon_app"
 BG_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -34,8 +35,8 @@ while [[ $# -gt 0 ]]; do
         --data-dir)      DATA_DIR="$2"; shift 2 ;;
         --mode)          MODE="$2"; shift 2 ;;
         --scan)          SCAN="$2"; shift 2 ;;
-        --fold-slice)    FOLD_SLICE="$2"; shift 2 ;;
-        --env-setup)     ENV_SETUP="$2"; shift 2 ;;
+        --image)         IMAGE="$2"; shift 2 ;;
+        --app)           APP="$2"; shift 2 ;;
         --bg-file)       BG_FILE="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
@@ -88,44 +89,54 @@ rm -rf "${OUTPUT_DIR}"
 mkdir -p "${OUTPUT_DIR}"
 
 # ==============================================================
-# Step 0: Generate the workflow (renders Scripts/run_<scan>.m)
+# Step 0: Generate the workflow (writes Params/<scan>.json)
 # ==============================================================
 log_step "0. workflow_generator.py"
 
-# Written into the MATLAB scripts; a placeholder when MATLAB isn't run
-FS_DIR="${FOLD_SLICE:-/path/to/fold_slice}"
+# The generator only registers the app and the image; stand-ins when the
+# reconstruction isn't run
+GEN_APP="${APP}"
+if [ ! -f "${GEN_APP}" ]; then
+    if [ -n "${IMAGE}" ]; then
+        log_error "No compiled app at ${APP} (build it with app/build_app.sh)"
+        exit 1
+    fi
+    GEN_APP="${OUTPUT_DIR}/ptycho_recon_app"
+    touch "${GEN_APP}"
+fi
+GEN_IMAGE="$(cd "$(dirname "${IMAGE:-/}")" && pwd)/$(basename "${IMAGE:-matlab-runtime.sif}")"
 
 ( cd "${OUTPUT_DIR}" && python3 "${SCRIPT_DIR}/workflow_generator.py" \
     --data-dir "${DATA_DIR}" --mode "${MODE}" \
-    --site-catalog-file access-pegasus.yml --bg-file "${BG_FILE}" --fold-slice-dir "${FS_DIR}" )
+    --site-catalog-file usc-discovery.yml --bg-file "${BG_FILE}" \
+    --app "${GEN_APP}" --container-image "${GEN_IMAGE}" )
 
 check_file "${OUTPUT_DIR}/workflow.yml" "Workflow generated"
 
 if [ -n "${SCAN}" ]; then
-    SCRIPT=$(ls "${SCRIPT_DIR}"/Scripts/run_"${SCAN}"_*.m 2>/dev/null | head -1 || true)
+    PARAMS=$(ls "${SCRIPT_DIR}"/Params/"${SCAN}"_*.json 2>/dev/null | head -1 || true)
 else
-    SCRIPT=$(ls "${SCRIPT_DIR}"/Scripts/run_*.m 2>/dev/null | head -1 || true)
+    PARAMS=$(ls "${SCRIPT_DIR}"/Params/*.json 2>/dev/null | head -1 || true)
 fi
-if [ -z "${SCRIPT}" ]; then
-    log_error "No rendered script found${SCAN:+ for scan ${SCAN}}"
+if [ -z "${PARAMS}" ]; then
+    log_error "No parameter file found${SCAN:+ for scan ${SCAN}}"
     exit 1
 fi
-check_file "${SCRIPT}" "Rendered script"
+check_file "${PARAMS}" "Parameter file"
 
-log_info "Rendered parameter block:"
-sed -n '/^%% Step 1/,/^Niter =/p' "${SCRIPT}" | grep -v "^ *%" | head -40
+log_info "Parameters:"
+cat "${PARAMS}"
 
 # ==============================================================
 # Step 1: ptycho_recon (GPU + MATLAB)
 # ==============================================================
 log_step "1. ptycho_recon"
 
-if [ -z "${FOLD_SLICE}" ]; then
-    log_warning "Skipping MATLAB reconstruction (pass --fold-slice on a GPU node with MATLAB)."
+if [ -z "${IMAGE}" ]; then
+    log_warning "Skipping the reconstruction (pass --image on a GPU node with Apptainer)."
 else
     # The scan folder and raw file, as the generator found them
-    SCRIPT_BASE=$(basename "${SCRIPT}" .m)
-    JOB_ID=${SCRIPT_BASE#run_}
+    JOB_ID=$(basename "${PARAMS}" .json)
     ACQU=${JOB_ID%%_*}
     SCAN_FOLDER=$(cd "${DATA_DIR}" && ls -d "${ACQU}"_*/ | head -1)
     SCAN_FOLDER=${SCAN_FOLDER%/}
@@ -133,21 +144,26 @@ else
 
     WORK="${OUTPUT_DIR}/${JOB_ID}"
     mkdir -p "${WORK}"
-    cp "${SCRIPT}" "${WORK}/"
-    # Place the raw file at its deep LFN, as Pegasus would
+    cp "${PARAMS}" "${APP}" "${WORK}/"
+    # Place the raw file at its deep LFN, as Pegasus would. A copy: the
+    # container sees only the job directory, where a link would dangle
     mkdir -p "${WORK}/Data/${SCAN_FOLDER}"
-    ln -sf "${RAW}" "${WORK}/Data/${SCAN_FOLDER}/$(basename "${RAW}")"
+    cp "${RAW}" "${WORK}/Data/${SCAN_FOLDER}/"
     RECON_ARGS=(
-        --script "$(basename "${SCRIPT}")"
+        --app "$(basename "${APP}")"
+        --params "$(basename "${PARAMS}")"
         --raw "Data/${SCAN_FOLDER}/$(basename "${RAW}")"
         --output-tar "${JOB_ID}/${JOB_ID}_recon.tar.gz"
         --log "${JOB_ID}/${JOB_ID}_matlab.log"
     )
     if [ -f "${BG_FILE}" ]; then
-        RECON_ARGS+=(--bg-file "${BG_FILE}")
+        cp "${BG_FILE}" "${WORK}/background_subtraction.mat"
+        RECON_ARGS+=(--bg-file background_subtraction.mat)
     fi
-    # Source the job setup script first, as PegasusLite does
-    ( cd "${WORK}" && source "${ENV_SETUP}" && python3 "${SCRIPT_DIR}/bin/ptycho_recon.py" "${RECON_ARGS[@]}" )
+    cp "${SCRIPT_DIR}/bin/ptycho_recon.py" "${WORK}/"
+    # In the container, with only the job directory mounted at /srv, as PegasusLite does
+    ( cd "${WORK}" && apptainer exec --no-home --nv --bind "${WORK}:/srv" --pwd /srv "${IMAGE}" \
+        python3 ptycho_recon.py "${RECON_ARGS[@]}" )
     check_file "${WORK}/${JOB_ID}/${JOB_ID}_recon.tar.gz" "ptycho_recon"
 fi
 
