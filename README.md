@@ -32,6 +32,29 @@ jobs are independent, exactly like the old per-scan `srun` lines.
 |------|------|-------------|
 | ptycho_recon | host MATLAB + fold_slice, 1 GPU | Lays out the staged inputs as the template expects, runs `matlab -batch run_<scan>`, and packs `Recon_result/` into a tarball. |
 
+### Workflow graphs
+
+The abstract workflow for one scan, with its files. The rendered MATLAB script
+and the raw 4D-STEM file go in, and the MATLAB log and the `Recon_result/`
+tarball come out:
+
+![Abstract workflow with files](images/ptycho-abstract-files.png)
+
+The executable workflow that `pegasus-plan` builds from it for site
+`compute`. Pegasus adds the job that creates the scratch directory, the
+stage-in and stage-out of the files, and the cleanup jobs around the
+reconstruction:
+
+![Executable workflow](images/ptycho-concrete.png)
+
+Both are drawn with `pegasus-graphviz`, which calls Graphviz `dot` for a
+`.png` output:
+
+```bash
+pegasus-graphviz --files -o images/ptycho-abstract-files.png workflow.yml
+pegasus-graphviz -o images/ptycho-concrete.png submit/<user>/pegasus/ptycho/runNNNN/ptycho-0.dag
+```
+
 ## Directory Structure
 
 ```
@@ -44,6 +67,7 @@ pegasus-ptycho/
 │   └── Ptychography_reconstruction_singleslice_template.m
 ├── config/
 │   └── rbf.xlsx                 # rbf calibration (voltage, camera length, conv. angle)
+├── images/                      # Workflow graphs shown in this README
 ├── run_manual.sh                # Local test
 └── README.md
 ```
