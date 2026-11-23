@@ -1,0 +1,78 @@
+Bootstrap: docker
+From: hub.opensciencegrid.org/htc/rocky:8
+
+# MATLAB Runtime, adapted from the OSG htc/matlab-runtime:R2026a image
+# https://github.com/osg-htc/htc-images/blob/main/htc/matlab-runtime%3AR2026a/Dockerfile
+#
+# No CUDA in the image: the Runtime ships the CUDA libraries MATLAB's GPU
+# support uses (CUDA 12.2 for R2024a-R2026a) in bin/glnxa64, and the driver
+# (libcuda.so) comes from the host with `apptainer exec --nv`
+#
+# The Runtime must be the release the app was compiled with (mcc). Build for
+# another release with, e.g.
+#   apptainer build --build-arg RELEASE=R2025b --build-arg UPDATE=3 \
+#       matlab-runtime-R2025b.sif container/apptainer.def
+# Run GPU jobs with `apptainer exec --nv`.
+
+%arguments
+    RELEASE=R2026a
+    UPDATE=4
+
+%setup
+    # Mount points for the host directories a cluster's apptainer.conf binds
+    # into every container ("bind path"), at build time too. A writable build
+    # container cannot create them itself (USC CARC binds /apps; see
+    # `grep '^bind path' /etc/apptainer/apptainer.conf`)
+    for d in apps project project2 scratch scratch1 scratch2 home1 spack; do
+        mkdir -p ${APPTAINER_ROOTFS}/$d
+    done
+
+%labels
+    opensciencegrid.name "Matlab Runtime"
+    opensciencegrid.description "MATLAB Runtime {{ RELEASE }} Update {{ UPDATE }} on Rocky Linux 8, to execute compiled MATLAB codes"
+    opensciencegrid.url "https://www.mathworks.com/products/compiler/matlab-runtime.html"
+    opensciencegrid.category "Languages"
+    opensciencegrid.definition_url "https://github.com/osg-htc/htc-images"
+
+%post
+    set -e
+
+    # Runtime dependencies, from MathWorks' list for RHEL 8 (ubi8); the base image
+    # already has some of them
+    # https://github.com/mathworks-ref-arch/container-images/tree/main/matlab-deps
+    dnf -y install --allowerasing \
+        alsa-lib at-spi2-atk at-spi2-core atk cairo cairo-gobject cups-libs \
+        fontconfig fribidi gdk-pixbuf2 glib2 glibc glibc-langpack-en \
+        glibc-locale-source gtk3 libICE \
+        libXcomposite libXcursor libXdamage libXfixes libXft libXinerama \
+        libXrandr libXt libXtst libXxf86vm libatomic libcap libdrm \
+        libglvnd-glx libibverbs librdmacm libsndfile libtirpc libtool-ltdl \
+        libuuid libxcrypt make mesa-libgbm net-tools nspr nss nss-util \
+        numactl-libs pam pango pixman procps-ng systemd-libs unzip which zlib \
+        wget
+    dnf clean all
+
+    # MATLAB Runtime
+    cd /tmp
+    wget -nv https://ssd.mathworks.com/supportfiles/downloads/{{ RELEASE }}/Release/{{ UPDATE }}/deployment_files/installer/complete/glnxa64/MATLAB_Runtime_{{ RELEASE }}_Update_{{ UPDATE }}_glnxa64.zip
+    unzip -q MATLAB_Runtime_*.zip -d MATLAB_Runtime_Installer
+    cd MATLAB_Runtime_Installer
+    ./install -mode silent -agreeToLicense yes \
+        -destinationFolder /opt/matlabruntime -outputFile /tmp/install.log
+    cd /tmp
+    rm -rf MATLAB_Runtime_*.zip MATLAB_Runtime_Installer
+
+    # The installer puts the Runtime in /opt/matlabruntime/<release>; give it a
+    # fixed path for %environment
+    test -d /opt/matlabruntime/{{ RELEASE }} || { cat /tmp/install.log; exit 1; }
+    ln -sfn /opt/matlabruntime/{{ RELEASE }} /opt/matlabruntime/current
+    rm -f /tmp/install.log
+
+%environment
+    export MATLAB_RUNTIME=/opt/matlabruntime/current
+    export LD_LIBRARY_PATH=${MATLAB_RUNTIME}/runtime/glnxa64:${MATLAB_RUNTIME}/bin/glnxa64:${MATLAB_RUNTIME}/sys/os/glnxa64:${MATLAB_RUNTIME}/extern/bin/glnxa64:${LD_LIBRARY_PATH}
+    export LANG=en_US.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%test
+    test -d ${MATLAB_RUNTIME}/runtime/glnxa64
