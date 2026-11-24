@@ -98,6 +98,11 @@ def make_app_source(template_str, mode, name):
     # A compiled app contains its code: adding fold_slice to the path would
     # at best do nothing
     src = re.sub(r"^(addpath\(.*\);)", r"if ~isdeployed, \1 end", src, flags=re.M)
+    # save.external saves the final figures in a new session started with
+    # system('matlab ... &'): there is no MATLAB in the Runtime container
+    src = re.sub(r"^(p\.\s*save\.external\s*=\s*)true;",
+                 r"\1false; % (was true: no MATLAB to start in the compiled app)",
+                 src, flags=re.M)
     # The script runs inside ptycho_recon_app: clear would remove P
     src = re.sub(r"^clear;\s*clc;", "% clear;clc; (removed: would clear the parameters P)",
                  src, flags=re.M)

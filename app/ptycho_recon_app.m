@@ -20,6 +20,15 @@ switch P.mode
     otherwise
         error('ptycho_recon_app:mode', 'Unknown mode "%s" in %s', P.mode, params_file)
 end
+
+% A compiled app does not exit while any figure is open, even an invisible
+% one (fold_slice plots when p.use_display is set), and anything else still
+% running would keep it as well: the reconstruction is done, so end it here
+close all force
+if isdeployed
+    fprintf('ptycho_recon_app: done\n');
+    exit(0);
+end
 end
 
 

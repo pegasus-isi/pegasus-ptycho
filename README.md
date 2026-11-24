@@ -305,7 +305,13 @@ so the templates are compiled once, reading the values at run time.
   which then runs `ptycho_recon_<mode>` in its workspace;
 - the `addpath` lines run only outside the compiled app (`~isdeployed`), as
   fold_slice is compiled in;
-- `clear;clc;` is removed, as it would clear `P`.
+- `clear;clc;` is removed, as it would clear `P`;
+- `p.save.external` is set to `false`: it saves the final figures in a new
+  MATLAB session (`system('matlab ... &')`), and the container has only the
+  Runtime.
+
+After the reconstruction the app closes any figures and exits: a compiled app
+otherwise waits for its figures to be closed, and the job never ends.
 
 Pegasus runs each job in its own scratch directory, so `exp_dir` cannot be a
 fixed path: the app sets it to the directory it runs in, the job directory.
