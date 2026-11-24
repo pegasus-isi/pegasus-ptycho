@@ -309,8 +309,11 @@ so the templates are compiled once, reading the values at run time.
 
 Pegasus runs each job in its own scratch directory, so `exp_dir` cannot be a
 fixed path: the app sets it to the directory it runs in, the job directory.
-`cSAXS_matlab_path` and `ptycho_matlab_path` point there too; fold_slice only
-writes its process ID file under them.
+`ptycho_matlab_path` points at fold_slice's `ptycho/` folder inside the app
+(and `cSAXS_matlab_path` at the folder above): besides calling its functions,
+fold_slice lists its own folders, e.g. `+detector/+prep_data` for the
+detector functions. The app finds that folder with `which` and prints it to
+the log.
 
 The raw file is registered as a **deep LFN**,
 `Data/<scan folder>/scan_xN_yN.raw`. That is the path the template reads

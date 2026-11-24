@@ -36,10 +36,18 @@ for f = fieldnames(P)'
     end
 end
 
-% Paths only known in the job. fold_slice is compiled into the app; its
-% paths point at the job directory, where fold_slice may write its process
-% ID file (utils/.tmp_procID)
+% Paths only known in the job
 P.exp_dir = [pwd '/'];
-P.cSAXS_matlab_path = pwd;
-P.ptycho_matlab_path = pwd;
+
+% fold_slice is compiled into the app, but it also lists its own folders
+% (detector.prep_data.update_defaults reads <ptycho>/+detector/+prep_data),
+% so its paths point at its copy in the app: ptycho/ and the folder above.
+% (Run uncompiled, the same finds the fold_slice on the MATLAB path.)
+update_defaults = which('detector.prep_data.update_defaults');
+if isempty(update_defaults)
+    error('ptycho_recon_app:fold_slice', 'fold_slice not found (detector.prep_data.update_defaults)')
+end
+P.ptycho_matlab_path = fileparts(fileparts(fileparts(update_defaults)));
+P.cSAXS_matlab_path = fileparts(P.ptycho_matlab_path);
+fprintf('fold_slice: ptycho_matlab_path = %s\n', P.ptycho_matlab_path);
 end
