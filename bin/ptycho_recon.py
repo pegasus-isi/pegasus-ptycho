@@ -87,6 +87,10 @@ def reconstruct(args, scan_name):
 
     env = dict(os.environ)
     env.pop("DISPLAY", None)  # as `unset DISPLAY` in the sbatch file
+    # The Runtime starts Qt when the template plots or saves images; with no
+    # display Qt aborts the app ("no Qt platform plugin could be initialized")
+    # unless it renders off screen
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
     # Where the Runtime unpacks the app: per job, not the shared ~/.MathWorks
     env["MCR_CACHE_ROOT"] = os.path.join(job_dir, "mcr_cache")
 
